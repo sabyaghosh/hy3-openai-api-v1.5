@@ -58,8 +58,18 @@ from typing import Any, AsyncIterator, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+
+from logging_layer import (
+    RequestRecord,
+    get_log_summary,
+    get_recent_logs,
+    get_recent_requests,
+    log_event,
+    new_request_id,
+)
 
 HY3_BASE = "https://tencent-Hy3.hf.space/gradio_api/call/chat"
 DEFAULT_MODEL = "hy3"
@@ -78,8 +88,19 @@ QUEUE_TIMEOUT = float(os.environ.get("QUEUE_TIMEOUT", "5.0"))
 
 app = FastAPI(
     title="Hy3 OpenAI-Compatible API",
-    version="1.1.0",
+    version="1.2.0",
     description="OpenAI-compatible proxy for Tencent Hy3 295B MoE via HuggingFace Gradio API.",
+)
+
+# CORS — allow the Next.js admin panel (and any OpenAI client) to call this API.
+# Configure allowed origins via ADMIN_ORIGIN env var (default: permissive for dev).
+_admin_origin = os.environ.get("ADMIN_ORIGIN", "*")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[_admin_origin] if _admin_origin != "*" else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -253,46 +274,211 @@ def build_payload(
     }
 
 
-async def call_hy3_stream(payload: dict) -> AsyncIterator[list]:
+async def call_hy3_stream(
+    payload: dict,
+    request_id: Optional[str] = None,
+    record: Optional[RequestRecord] = None,
+) -> AsyncIterator[list]:
     """
     POST to Hy3 to get event_id, then GET the SSE stream.
     Yields parsed SSE data payloads (the JSON list inside `data:`).
+    Instrumented with detailed logging at every step.
     """
+    t_post_start = time.perf_counter()
+    log_event(
+        "info",
+        "upstream.post.start",
+        request_id=request_id,
+        url=HY3_BASE,
+        payload_size_bytes=len(json.dumps(payload, default=str)),
+        msg_preview=(payload.get("data", [""])[0] or "")[:80],
+        history_len=len(payload.get("data", [""] * 4)[2] if len(payload.get("data", [])) > 2 else []),
+        tools_count=len(json.loads(payload.get("data", [""] * 9)[8]) if len(payload.get("data", [])) > 8 and isinstance(payload.get("data", [])[8], str) else "[]"),
+    )
+
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         # Step 1: get event_id
-        r = await client.post(HY3_BASE, json=payload)
+        try:
+            r = await client.post(HY3_BASE, json=payload)
+        except httpx.TimeoutException as e:
+            log_event(
+                "error",
+                "upstream.post.timeout",
+                request_id=request_id,
+                error=f"{type(e).__name__}: {e}",
+                elapsed_ms=round((time.perf_counter() - t_post_start) * 1000, 1),
+            )
+            if record:
+                record.error = f"upstream POST timeout: {e}"
+            raise HTTPException(status_code=504, detail=f"Hy3 POST timeout: {e}")
+        except httpx.HTTPError as e:
+            log_event(
+                "error",
+                "upstream.post.error",
+                request_id=request_id,
+                error=f"{type(e).__name__}: {e}",
+                elapsed_ms=round((time.perf_counter() - t_post_start) * 1000, 1),
+            )
+            if record:
+                record.error = f"upstream POST error: {e}"
+            raise HTTPException(status_code=502, detail=f"Hy3 POST failed: {e}")
+
+        post_latency_ms = round((time.perf_counter() - t_post_start) * 1000, 1)
+        if record:
+            record.upstream_post_status = r.status_code
+            record.upstream_post_latency_ms = post_latency_ms
+
         if r.status_code != 200:
+            body_preview = r.text[:300]
+            log_event(
+                "error",
+                "upstream.post.non_200",
+                request_id=request_id,
+                status=r.status_code,
+                body=body_preview,
+                elapsed_ms=post_latency_ms,
+            )
+            if record:
+                record.error = f"upstream POST {r.status_code}: {body_preview}"
             raise HTTPException(
                 status_code=502,
-                detail=f"Hy3 POST failed ({r.status_code}): {r.text[:200]}",
+                detail=f"Hy3 POST failed ({r.status_code}): {body_preview}",
             )
-        event_id = r.json().get("event_id")
+
+        try:
+            event_id = r.json().get("event_id")
+        except Exception as e:
+            log_event(
+                "error",
+                "upstream.post.bad_json",
+                request_id=request_id,
+                error=str(e),
+                body=r.text[:300],
+            )
+            if record:
+                record.error = f"upstream POST bad JSON: {e}"
+            raise HTTPException(status_code=502, detail=f"Hy3 POST returned bad JSON: {e}")
+
         if not event_id:
+            log_event(
+                "error",
+                "upstream.post.no_event_id",
+                request_id=request_id,
+                body=r.text[:300],
+            )
+            if record:
+                record.error = "upstream POST returned no event_id"
             raise HTTPException(status_code=502, detail="Hy3 returned no event_id")
 
+        if record:
+            record.upstream_event_id = event_id
+        log_event(
+            "info",
+            "upstream.post.ok",
+            request_id=request_id,
+            event_id=event_id,
+            status=r.status_code,
+            elapsed_ms=post_latency_ms,
+        )
+
         # Step 2: stream SSE
-        async with client.stream("GET", f"{HY3_BASE}/{event_id}") as resp:
-            if resp.status_code != 200:
-                body = await resp.aread()
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Hy3 stream GET failed ({resp.status_code}): {body[:200]}",
+        t_stream_start = time.perf_counter()
+        log_event(
+            "info",
+            "upstream.stream.start",
+            request_id=request_id,
+            url=f"{HY3_BASE}/{event_id}",
+        )
+
+        try:
+            async with client.stream("GET", f"{HY3_BASE}/{event_id}") as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    body_str = body.decode(errors="replace")[:300]
+                    log_event(
+                        "error",
+                        "upstream.stream.non_200",
+                        request_id=request_id,
+                        status=resp.status_code,
+                        body=body_str,
+                    )
+                    if record:
+                        record.error = f"upstream stream GET {resp.status_code}: {body_str}"
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Hy3 stream GET failed ({resp.status_code}): {body_str}",
+                    )
+                chunk_count = 0
+                buffer = ""
+                first_chunk_latency_ms: Optional[float] = None
+                async for chunk in resp.aiter_text():
+                    buffer += chunk
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line.startswith("data: "):
+                            continue
+                        payload_str = line[6:]
+                        if payload_str in ("", "null", "[DONE]"):
+                            continue
+                        try:
+                            data = json.loads(payload_str)
+                        except json.JSONDecodeError as e:
+                            log_event(
+                                "warning",
+                                "upstream.stream.bad_json",
+                                request_id=request_id,
+                                error=str(e),
+                                line=payload_str[:200],
+                            )
+                            continue
+                        chunk_count += 1
+                        if first_chunk_latency_ms is None:
+                            first_chunk_latency_ms = round(
+                                (time.perf_counter() - t_stream_start) * 1000, 1
+                            )
+                            log_event(
+                                "info",
+                                "upstream.stream.first_chunk",
+                                request_id=request_id,
+                                chunk_index=chunk_count,
+                                ttfb_ms=first_chunk_latency_ms,
+                            )
+                        yield data
+
+                stream_total_ms = round((time.perf_counter() - t_stream_start) * 1000, 1)
+                if record:
+                    record.upstream_stream_latency_ms = stream_total_ms
+                    record.upstream_chunks = chunk_count
+                log_event(
+                    "info",
+                    "upstream.stream.done",
+                    request_id=request_id,
+                    chunks=chunk_count,
+                    elapsed_ms=stream_total_ms,
                 )
-            buffer = ""
-            async for chunk in resp.aiter_text():
-                buffer += chunk
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line.startswith("data: "):
-                        continue
-                    payload_str = line[6:]
-                    if payload_str in ("", "null", "[DONE]"):
-                        continue
-                    try:
-                        yield json.loads(payload_str)
-                    except json.JSONDecodeError:
-                        continue
+        except httpx.TimeoutException as e:
+            log_event(
+                "error",
+                "upstream.stream.timeout",
+                request_id=request_id,
+                error=f"{type(e).__name__}: {e}",
+                elapsed_ms=round((time.perf_counter() - t_stream_start) * 1000, 1),
+            )
+            if record:
+                record.error = f"upstream stream timeout: {e}"
+            raise HTTPException(status_code=504, detail=f"Hy3 stream timeout: {e}")
+        except httpx.HTTPError as e:
+            log_event(
+                "error",
+                "upstream.stream.error",
+                request_id=request_id,
+                error=f"{type(e).__name__}: {e}",
+                elapsed_ms=round((time.perf_counter() - t_stream_start) * 1000, 1),
+            )
+            if record:
+                record.error = f"upstream stream error: {e}"
+            raise HTTPException(status_code=502, detail=f"Hy3 stream failed: {e}")
 
 
 def parse_hy3_data(data: list) -> tuple[str, str, list, list]:
@@ -396,8 +582,17 @@ def make_tool_call_delta(tool_calls: list) -> list:
 async def root():
     return {
         "service": "Hy3 OpenAI-Compatible API",
-        "version": "1.1.0",
-        "endpoints": ["/", "/health", "/stats", "/v1/models", "/v1/chat/completions"],
+        "version": "1.2.0",
+        "endpoints": [
+            "/",
+            "/health",
+            "/stats",
+            "/v1/models",
+            "/v1/chat/completions",
+            "/admin/logs",
+            "/admin/requests",
+            "/admin/logs/summary",
+        ],
         "models": ["hy3", "hy3-think"],
         "usage": "Point your OpenAI client to http://<host>:<port>/v1 with any API key",
         "limits": {"max_concurrent": MAX_CONCURRENT, "queue_timeout": QUEUE_TIMEOUT},
@@ -444,14 +639,61 @@ async def list_models():
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest):
+async def chat_completions(req: ChatCompletionRequest, request: Request):
+    # Per-request ID + record for tracing through the entire pipeline
+    request_id = new_request_id()
+    client_ip = request.client.host if request.client else "unknown"
+    record = RequestRecord(
+        request_id=request_id,
+        method="POST",
+        path="/v1/chat/completions",
+        client_ip=client_ip,
+    )
+    record.model = req.model
+    record.stream = req.stream
+    record.has_tools = bool(req.tools)
+    record.message_count = len(req.messages)
+    record.think_level = req.think_level or DEFAULT_THINK_LEVEL
+    # Find last user message for preview
+    for m in reversed(req.messages):
+        if m.role == "user" and m.content:
+            record.user_message_preview = m.content[:100]
+            break
+    record.has_history = len(req.messages) > 1
+
+    log_event(
+        "info",
+        "request.start",
+        request_id=request_id,
+        method="POST",
+        path="/v1/chat/completions",
+        client_ip=client_ip,
+        model=req.model,
+        stream=req.stream,
+        has_tools=record.has_tools,
+        message_count=record.message_count,
+        think_level=record.think_level,
+        user_agent=request.headers.get("user-agent", "")[:100],
+        user_msg_preview=record.user_message_preview,
+    )
+
     # Map "hy3-think" model to think_level=high (unless user explicitly set think_level)
     think_level = req.think_level or DEFAULT_THINK_LEVEL
     if req.model == "hy3-think" and think_level == DEFAULT_THINK_LEVEL:
         think_level = "high"
+        record.think_level = "high"
 
     msg, sys_prompt, history = messages_to_hy3(req.messages)
     if not msg and not (req.messages and req.messages[-1].content):
+        log_event(
+            "warning",
+            "request.bad_request",
+            request_id=request_id,
+            error="No user message provided",
+        )
+        record.status_code = 400
+        record.error = "No user message provided"
+        record.finalize()
         raise HTTPException(status_code=400, detail="No user message provided")
 
     payload = build_payload(
@@ -468,10 +710,26 @@ async def chat_completions(req: ChatCompletionRequest):
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
     # ----- Concurrency cap: acquire a slot before touching upstream Hy3 -----
+    t_queue_start = time.perf_counter()
+    record.concurrency_active_at_start = limiter.active
     acquired = await limiter.acquire()
+    record.queued_ms = round((time.perf_counter() - t_queue_start) * 1000, 1)
+
     if not acquired:
         # At capacity and queue_timeout expired — fail fast with 503 + Retry-After
         retry_after = max(1, int(QUEUE_TIMEOUT))
+        log_event(
+            "warning",
+            "request.rejected_503",
+            request_id=request_id,
+            reason="server_at_capacity",
+            max_concurrent=MAX_CONCURRENT,
+            active=limiter.active,
+            queued_ms=record.queued_ms,
+        )
+        record.status_code = 503
+        record.error = "Server at capacity"
+        record.finalize()
         return JSONResponse(
             status_code=503,
             content={
@@ -488,19 +746,37 @@ async def chat_completions(req: ChatCompletionRequest):
                 "Retry-After": str(retry_after),
                 "X-Max-Concurrent": str(MAX_CONCURRENT),
                 "X-Active-Requests": str(limiter.active),
+                "X-Request-Id": request_id,
             },
         )
+
+    log_event(
+        "info",
+        "request.slot_acquired",
+        request_id=request_id,
+        queued_ms=record.queued_ms,
+        active=limiter.active,
+        peak=limiter.peak_active,
+    )
 
     if req.stream:
         # Streaming path: release the slot when the generator finishes (or aborts)
         return StreamingResponse(
-            stream_openai(completion_id, req.model, payload, limiter=limiter),
+            stream_openai(
+                completion_id,
+                req.model,
+                payload,
+                limiter=limiter,
+                request_id=request_id,
+                record=record,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
                 "Connection": "keep-alive",
                 "X-Max-Concurrent": str(MAX_CONCURRENT),
+                "X-Request-Id": request_id,
             },
         )
 
@@ -510,7 +786,7 @@ async def chat_completions(req: ChatCompletionRequest):
     final_tools: list = []
     errored = False
     try:
-        async for data in call_hy3_stream(payload):
+        async for data in call_hy3_stream(payload, request_id=request_id, record=record):
             resp, think, tools, _ = parse_hy3_data(data)
             if resp:
                 final_resp = resp
@@ -520,12 +796,48 @@ async def chat_completions(req: ChatCompletionRequest):
                 final_tools = tools
     except HTTPException as e:
         errored = True
+        record.status_code = e.status_code
+        record.error = str(e.detail)[:300]
+        log_event(
+            "error",
+            "request.upstream_http_error",
+            request_id=request_id,
+            status=e.status_code,
+            error=str(e.detail)[:300],
+        )
         raise
     except Exception as e:
         errored = True
+        record.status_code = 502
+        record.error = str(e)[:300]
+        log_event(
+            "error",
+            "request.unhandled_error",
+            request_id=request_id,
+            error=f"{type(e).__name__}: {e}",
+        )
         raise HTTPException(status_code=502, detail=f"Hy3 call failed: {e}")
     finally:
         limiter.release(errored=errored)
+
+    record.response_chars = len(final_resp)
+    record.response_thinking_chars = len(final_think)
+    record.response_tool_calls = len(final_tools)
+    record.finish_reason = "tool_calls" if final_tools else "stop"
+    record.status_code = 200
+    record.finalize()
+
+    log_event(
+        "info",
+        "request.done",
+        request_id=request_id,
+        status=200,
+        duration_ms=record.to_dict()["duration_ms"],
+        response_chars=record.response_chars,
+        thinking_chars=record.response_thinking_chars,
+        tool_calls=record.response_tool_calls,
+        finish_reason=record.finish_reason,
+    )
 
     message: dict = {"role": "assistant", "content": final_resp}
     if final_think:
@@ -560,6 +872,8 @@ async def stream_openai(
     model: str,
     payload: dict,
     limiter: Optional[ConcurrencyLimiter] = None,
+    request_id: Optional[str] = None,
+    record: Optional[RequestRecord] = None,
 ):
     """Yield OpenAI-format SSE chunks. Releases the limiter slot in finally."""
     last_resp_len = 0
@@ -567,11 +881,19 @@ async def stream_openai(
     final_tools: Optional[list] = None
     errored = False
 
+    log_event(
+        "info",
+        "stream.start",
+        request_id=request_id,
+        completion_id=completion_id,
+        model=model,
+    )
+
     # Initial role chunk
     yield f"data: {json.dumps(make_chunk(completion_id, model, role='assistant'))}\n\n"
 
     try:
-        async for data in call_hy3_stream(payload):
+        async for data in call_hy3_stream(payload, request_id=request_id, record=record):
             resp, think, tools, _ = parse_hy3_data(data)
 
             # Emit thinking deltas (as reasoning_content, OpenAI o1-style)
@@ -581,6 +903,8 @@ async def stream_openai(
                 )
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 last_think_len = len(think)
+                if record:
+                    record.response_thinking_chars = len(think)
 
             # Emit response deltas
             if resp and len(resp) > last_resp_len:
@@ -589,6 +913,8 @@ async def stream_openai(
                 )
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 last_resp_len = len(resp)
+                if record:
+                    record.response_chars = len(resp)
 
             if tools:
                 final_tools = tools
@@ -598,10 +924,27 @@ async def stream_openai(
             tc_delta = make_tool_call_delta(final_tools)
             yield f"data: {json.dumps(make_chunk(completion_id, model, tool_calls=tc_delta), ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps(make_chunk(completion_id, model, finish_reason='tool_calls'))}\n\n"
+            if record:
+                record.response_tool_calls = len(final_tools)
+                record.finish_reason = "tool_calls"
         else:
             yield f"data: {json.dumps(make_chunk(completion_id, model, finish_reason='stop'))}\n\n"
+            if record:
+                record.finish_reason = "stop"
 
         yield "data: [DONE]\n\n"
+        if record:
+            record.status_code = 200
+            record.finalize()
+        log_event(
+            "info",
+            "stream.done",
+            request_id=request_id,
+            response_chars=last_resp_len,
+            thinking_chars=last_think_len,
+            tool_calls=len(final_tools or []),
+            finish_reason=record.finish_reason if record else None,
+        )
     except httpx.HTTPStatusError as e:
         errored = True
         err = {
@@ -612,21 +955,93 @@ async def stream_openai(
         }
         yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
+        if record:
+            record.status_code = 502
+            record.error = f"upstream HTTP {e.response.status_code}"
+            record.finalize()
+        log_event("error", "stream.upstream_error", request_id=request_id, error=str(e)[:200])
     except HTTPException as e:
         errored = True
         err = {"error": {"message": str(e.detail), "type": "upstream_error"}}
         yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
+        if record:
+            record.status_code = e.status_code
+            record.error = str(e.detail)[:300]
+            record.finalize()
+        log_event("error", "stream.http_error", request_id=request_id, status=e.status_code, error=str(e.detail)[:200])
     except Exception as e:
         errored = True
         err = {"error": {"message": str(e), "type": "internal_error"}}
         yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
+        if record:
+            record.status_code = 500
+            record.error = f"{type(e).__name__}: {e}"
+            record.finalize()
+        log_event("error", "stream.unhandled_error", request_id=request_id, error=f"{type(e).__name__}: {e}")
     finally:
         # ALWAYS release the limiter slot — even on client disconnect.
         # Without this, an aborted stream would leak the slot forever.
         if limiter is not None:
             limiter.release(errored=errored)
+
+
+# ----------------------- Admin Endpoints -----------------------
+
+
+@app.get("/admin/logs")
+async def admin_logs(
+    limit: int = 100,
+    level: Optional[str] = None,
+    request_id: Optional[str] = None,
+    event: Optional[str] = None,
+):
+    """
+    Return recent log entries from the in-memory ring buffer.
+    Filters: level (debug/info/warning/error), request_id, event name.
+    Newest first.
+    """
+    return {
+        "total": len(get_recent_logs(limit=10000)),
+        "returned": len(
+            get_recent_logs(limit=limit, level=level, request_id=request_id, event=event)
+        ),
+        "filters": {"level": level, "request_id": request_id, "event": event, "limit": limit},
+        "logs": get_recent_logs(
+            limit=limit, level=level, request_id=request_id, event=event
+        ),
+    }
+
+
+@app.get("/admin/requests")
+async def admin_requests(limit: int = 50, errors_only: bool = False):
+    """Return recent request records (newest first)."""
+    return {
+        "total_tracked": len(get_recent_requests(limit=10000)),
+        "returned": len(get_recent_requests(limit=limit, errors_only=errors_only)),
+        "filters": {"limit": limit, "errors_only": errors_only},
+        "requests": get_recent_requests(limit=limit, errors_only=errors_only),
+    }
+
+
+@app.get("/admin/logs/summary")
+async def admin_logs_summary():
+    """Counts by level + event — for dashboard widgets."""
+    return get_log_summary()
+
+
+@app.get("/admin/requests/{request_id}")
+async def admin_request_detail(request_id: str):
+    """Get a single request record + all log entries for it."""
+    requests = [r for r in get_recent_requests(limit=10000) if r["request_id"] == request_id]
+    logs = get_recent_logs(limit=500, request_id=request_id)
+    if not requests and not logs:
+        raise HTTPException(status_code=404, detail=f"Request {request_id} not found")
+    return {
+        "request": requests[0] if requests else None,
+        "logs": logs,
+    }
 
 
 # ----------------------- Entrypoint -----------------------
