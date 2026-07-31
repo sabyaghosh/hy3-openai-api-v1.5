@@ -1,0 +1,30 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "Get weather info for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "location": {"type": "string", "description": "City name"}
+        },
+        "required": ["location"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "calculate",
+      "description": "Evaluate a math expression",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": {"type": "string", "description": "Math expression to evaluate"}
+        },
+        "required": ["expression"]
+      }
+    }
+  }
+]

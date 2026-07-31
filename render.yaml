@@ -1,0 +1,24 @@
+# Render Blueprint — deploys hy3-openai-api as a web service
+# Docs: https://render.com/docs/blueprint-spec
+# After pushing this repo to GitHub, go to:
+#   New > Blueprint > select this repo
+# Render will read this file and create the service automatically.
+
+services:
+  - type: web
+    name: hy3-openai-api
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /v1/models
+    autoDeploy: true
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 8000
+      # Optional: protect your endpoint with a simple bearer token
+      # (server.py treats API key as no-op; add a proxy auth layer if needed)
+      - key: PYTHONUNBUFFERED
+        value: "1"
