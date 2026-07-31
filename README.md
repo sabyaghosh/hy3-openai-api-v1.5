@@ -143,6 +143,69 @@ docker run -p 8000:8000 hy3-openai-api
 | `HOST` | `0.0.0.0` | Bind host |
 | `PORT` | `8000` | Bind port (Render injects this automatically) |
 | `PYTHONUNBUFFERED` | — | Set to `1` for unbuffered logs |
+| `MAX_CONCURRENT` | `10` | Hard cap of in-flight Hy3 calls. Excess requests get queued (see `QUEUE_TIMEOUT`) |
+| `QUEUE_TIMEOUT` | `5` | Seconds to wait for a free slot before returning `503` with `Retry-After`. Set to `0` for non-blocking (instant 503 when at capacity) |
+
+### Concurrency control
+
+To prevent upstream Hy3 overload (and the 45s gateway timeouts that come with it), the server caps in-flight requests with an `asyncio.Semaphore`. When the cap is hit:
+
+- Requests wait up to `QUEUE_TIMEOUT` seconds for a slot to free up
+- If still no slot, the server returns **HTTP 503** with a `Retry-After` header and an OpenAI-style error body
+- Slots are released even on client disconnect or upstream errors (no leaks)
+
+Monitor load via the `/stats` endpoint:
+
+```bash
+curl https://hy3-openai-api.onrender.com/stats
+# {
+#   "max_concurrent": 10,
+#   "active_requests": 3,
+#   "peak_active": 7,
+#   "available_slots": 7,
+#   "total_acquired": 142,
+#   "total_rejected_503": 0,
+#   "total_completed": 139,
+#   "total_errors": 1,
+#   "uptime_seconds": 3611.4
+# }
+```
+
+### Health & stats endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /` | Service info |
+| `GET /health` | Liveness probe — returns 503 if `active_requests > max_concurrent` |
+| `GET /stats` | Runtime counters (active, peak, rejected, completed) |
+| `GET /v1/models` | OpenAI models list |
+| `POST /v1/chat/completions` | OpenAI chat completion (streaming + non-streaming) |
+
+### Deploy elsewhere (without Render's timeout issue)
+
+Render's free tier has aggressive gateway timeouts (~100s) and sleeps after 15 min idle. For long-running streaming or higher concurrency, consider:
+
+| Platform | Free tier | Sleeps? | Request timeout | Notes |
+|---|---|---|---|---|
+| **Fly.io** | 3 shared-cpu-1x VMs (256MB) | No | ~5min (configurable) | Best free option — global edge, no cold-start after deploy |
+| **Koyeb** | 1 service (512MB) | No | None (you control it) | Docker-native, simple CLI |
+| **Google Cloud Run** | 2M req/mo + 360k vCPU-seconds | Scales to zero | 60 min (max) | Generous, but cold-start 2-5s |
+| **Oracle Cloud Always Free** | 4 ARM cores + 24GB RAM | No | None (self-managed) | Best free compute, but you manage the OS |
+| **Railway** | $5 trial credit | No (on paid) | None | Closest to Render UX, $5/mo after trial |
+| **Hugging Face Spaces** | 2 vCPU / 16GB RAM | Yes (48h idle) | None | Same upstream as Hy3 itself |
+
+See **[DEPLOY.md](DEPLOY.md)** for platform-specific setup guides (Fly.io, Cloud Run, Koyeb, Oracle, Railway, HF Spaces).
+
+#### Run with Docker locally
+
+```bash
+docker build -t hy3-openai-api .
+docker run -p 8000:8000 \
+  -e MAX_CONCURRENT=10 \
+  -e QUEUE_TIMEOUT=5 \
+  hy3-openai-api
+# API now at http://localhost:8000/v1
+```
 
 ### Models
 

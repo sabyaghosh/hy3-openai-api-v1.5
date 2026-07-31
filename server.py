@@ -49,13 +49,15 @@ Tool calling:
 """
 
 import argparse
+import asyncio
 import json
+import os
 import time
 import uuid
 from typing import Any, AsyncIterator, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -66,11 +68,90 @@ DEFAULT_THINK_LEVEL = "no_think"
 PRESERVED_THINKING = True
 HTTP_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 
+# Concurrency control — prevents upstream Hy3 overload and gateway timeouts.
+# Tune via env vars:
+#   MAX_CONCURRENT  — hard cap of in-flight Hy3 calls (default 10)
+#   QUEUE_TIMEOUT   — seconds to wait for a slot before returning 503 (default 5.0)
+#                     Set to 0 for non-blocking (immediate 503 when at capacity).
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "10"))
+QUEUE_TIMEOUT = float(os.environ.get("QUEUE_TIMEOUT", "5.0"))
+
 app = FastAPI(
     title="Hy3 OpenAI-Compatible API",
-    version="1.0.0",
+    version="1.1.0",
     description="OpenAI-compatible proxy for Tencent Hy3 295B MoE via HuggingFace Gradio API.",
 )
+
+
+# ----------------------- Concurrency Limiter & Stats -----------------------
+
+
+class ConcurrencyLimiter:
+    """
+    Async semaphore with observability.
+    Acquire before calling upstream Hy3; release after the call completes
+    (including streaming responses — release in the generator's finally block).
+    """
+
+    def __init__(self, max_concurrent: int, queue_timeout: float):
+        self.max_concurrent = max_concurrent
+        self.queue_timeout = queue_timeout
+        self._sem = asyncio.Semaphore(max_concurrent)
+        # Stats counters (all best-effort; not strictly atomic but fine for observability)
+        self.active = 0
+        self.total_acquired = 0
+        self.total_rejected = 0
+        self.total_completed = 0
+        self.total_errors = 0
+        self.peak_active = 0
+        self.started_at = time.time()
+
+    async def acquire(self) -> bool:
+        """
+        Try to acquire a slot within queue_timeout. Returns True on success.
+        Note: asyncio.wait_for(sem.acquire(), timeout=0) has a race condition
+        where the timer can fire before the semaphore's acquire runs, causing
+        spurious failures even when slots are available. We work around this
+        by using a small minimum timeout (1ms) for the non-blocking path.
+        """
+        # If non-blocking mode requested, use 1ms minimum to let the event loop
+        # resolve racing acquires. This is fast enough to feel instant while
+        # avoiding the spurious-timeout race.
+        timeout = self.queue_timeout if self.queue_timeout > 0 else 0.001
+        try:
+            await asyncio.wait_for(self._sem.acquire(), timeout=timeout)
+            self.active += 1
+            self.total_acquired += 1
+            if self.active > self.peak_active:
+                self.peak_active = self.active
+            return True
+        except asyncio.TimeoutError:
+            self.total_rejected += 1
+            return False
+
+    def release(self, *, errored: bool = False) -> None:
+        self.active -= 1
+        self.total_completed += 1
+        if errored:
+            self.total_errors += 1
+        self._sem.release()
+
+    def stats(self) -> dict:
+        return {
+            "max_concurrent": self.max_concurrent,
+            "queue_timeout_seconds": self.queue_timeout,
+            "active_requests": self.active,
+            "peak_active": self.peak_active,
+            "available_slots": max(0, self.max_concurrent - self.active),
+            "total_acquired": self.total_acquired,
+            "total_rejected_503": self.total_rejected,
+            "total_completed": self.total_completed,
+            "total_errors": self.total_errors,
+            "uptime_seconds": round(time.time() - self.started_at, 1),
+        }
+
+
+limiter = ConcurrencyLimiter(MAX_CONCURRENT, QUEUE_TIMEOUT)
 
 
 # ----------------------- Pydantic Models -----------------------
@@ -315,11 +396,29 @@ def make_tool_call_delta(tool_calls: list) -> list:
 async def root():
     return {
         "service": "Hy3 OpenAI-Compatible API",
-        "version": "1.0.0",
-        "endpoints": ["/v1/models", "/v1/chat/completions"],
+        "version": "1.1.0",
+        "endpoints": ["/", "/health", "/stats", "/v1/models", "/v1/chat/completions"],
         "models": ["hy3", "hy3-think"],
         "usage": "Point your OpenAI client to http://<host>:<port>/v1 with any API key",
+        "limits": {"max_concurrent": MAX_CONCURRENT, "queue_timeout": QUEUE_TIMEOUT},
     }
+
+
+@app.get("/health")
+async def health():
+    """Liveness/readiness probe for container orchestrators (Render, Fly, K8s)."""
+    s = limiter.stats()
+    healthy = s["active_requests"] <= s["max_concurrent"]
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={"status": "ok" if healthy else "overloaded", **s},
+    )
+
+
+@app.get("/stats")
+async def stats():
+    """Runtime stats: active/peak/rejected request counters."""
+    return limiter.stats()
 
 
 @app.get("/v1/models")
@@ -368,21 +467,48 @@ async def chat_completions(req: ChatCompletionRequest):
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
+    # ----- Concurrency cap: acquire a slot before touching upstream Hy3 -----
+    acquired = await limiter.acquire()
+    if not acquired:
+        # At capacity and queue_timeout expired — fail fast with 503 + Retry-After
+        retry_after = max(1, int(QUEUE_TIMEOUT))
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": (
+                        f"Server at capacity ({MAX_CONCURRENT} concurrent requests). "
+                        f"Retry after {retry_after}s."
+                    ),
+                    "type": "server_at_capacity",
+                    "code": "concurrency_limit",
+                }
+            },
+            headers={
+                "Retry-After": str(retry_after),
+                "X-Max-Concurrent": str(MAX_CONCURRENT),
+                "X-Active-Requests": str(limiter.active),
+            },
+        )
+
     if req.stream:
+        # Streaming path: release the slot when the generator finishes (or aborts)
         return StreamingResponse(
-            stream_openai(completion_id, req.model, payload),
+            stream_openai(completion_id, req.model, payload, limiter=limiter),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
                 "Connection": "keep-alive",
+                "X-Max-Concurrent": str(MAX_CONCURRENT),
             },
         )
 
-    # Non-streaming: collect full response
+    # Non-streaming: collect full response; release the slot in finally
     final_resp = ""
     final_think = ""
     final_tools: list = []
+    errored = False
     try:
         async for data in call_hy3_stream(payload):
             resp, think, tools, _ = parse_hy3_data(data)
@@ -393,9 +519,13 @@ async def chat_completions(req: ChatCompletionRequest):
             if tools:
                 final_tools = tools
     except HTTPException as e:
+        errored = True
         raise
     except Exception as e:
+        errored = True
         raise HTTPException(status_code=502, detail=f"Hy3 call failed: {e}")
+    finally:
+        limiter.release(errored=errored)
 
     message: dict = {"role": "assistant", "content": final_resp}
     if final_think:
@@ -425,11 +555,17 @@ async def chat_completions(req: ChatCompletionRequest):
     }
 
 
-async def stream_openai(completion_id: str, model: str, payload: dict):
-    """Yield OpenAI-format SSE chunks."""
+async def stream_openai(
+    completion_id: str,
+    model: str,
+    payload: dict,
+    limiter: Optional[ConcurrencyLimiter] = None,
+):
+    """Yield OpenAI-format SSE chunks. Releases the limiter slot in finally."""
     last_resp_len = 0
     last_think_len = 0
     final_tools: Optional[list] = None
+    errored = False
 
     # Initial role chunk
     yield f"data: {json.dumps(make_chunk(completion_id, model, role='assistant'))}\n\n"
@@ -467,6 +603,7 @@ async def stream_openai(completion_id: str, model: str, payload: dict):
 
         yield "data: [DONE]\n\n"
     except httpx.HTTPStatusError as e:
+        errored = True
         err = {
             "error": {
                 "message": f"Hy3 upstream error: {e.response.status_code} {e.response.text[:200]}",
@@ -476,13 +613,20 @@ async def stream_openai(completion_id: str, model: str, payload: dict):
         yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
     except HTTPException as e:
+        errored = True
         err = {"error": {"message": str(e.detail), "type": "upstream_error"}}
         yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
     except Exception as e:
+        errored = True
         err = {"error": {"message": str(e), "type": "internal_error"}}
         yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
+    finally:
+        # ALWAYS release the limiter slot — even on client disconnect.
+        # Without this, an aborted stream would leak the slot forever.
+        if limiter is not None:
+            limiter.release(errored=errored)
 
 
 # ----------------------- Entrypoint -----------------------

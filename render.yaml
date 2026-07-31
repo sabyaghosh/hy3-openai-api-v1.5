@@ -11,14 +11,17 @@ services:
     plan: free
     region: oregon
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /v1/models
+    healthCheckPath: /health
     autoDeploy: true
     envVars:
       - key: HOST
         value: 0.0.0.0
       - key: PORT
         value: 8000
-      # Optional: protect your endpoint with a simple bearer token
-      # (server.py treats API key as no-op; add a proxy auth layer if needed)
       - key: PYTHONUNBUFFERED
         value: "1"
+      # Concurrency control — fail fast with 503 instead of timing out at the gateway
+      - key: MAX_CONCURRENT
+        value: "10"
+      - key: QUEUE_TIMEOUT
+        value: "5"
