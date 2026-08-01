@@ -3,7 +3,7 @@ OpenAI-compatible API server for Tencent Hy3 (295B MoE) via HuggingFace Gradio A
 No API key required. Drop-in replacement for OpenAI base_url.
 
 Run:
-    pip install fastapi uvicorn httpx pydantic
+    pip install "fastapi>=0.110" "uvicorn[standard]>=0.27" "httpx>=0.27" "pydantic>=2.5"
     python server.py --port 8000
 
 Use with the OpenAI Python SDK:
@@ -50,11 +50,12 @@ Tool calling:
 
 import argparse
 import asyncio
+import hmac
 import json
 import os
 import time
 import uuid
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional, Union
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -75,10 +76,20 @@ HY3_BASE = "https://tencent-Hy3.hf.space/gradio_api/call/chat"
 DEFAULT_MODEL = "hy3"
 DEFAULT_MAX_TOKENS = 262144
 DEFAULT_THINK_LEVEL = "no_think"
+# Whether to preserve thinking content in the Hy3 response. Passed as the 8th
+# field in the Gradio data payload. When True, Hy3 includes reasoning text in
+# the response so we can expose it as reasoning_content (OpenAI o1-style).
 PRESERVED_THINKING = True
-HTTP_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
+# Read timeout (90s) is below Render's ~100s gateway timeout so the upstream
+# call fails before the gateway returns 504 to the client (which would leave the
+# limiter slot occupied for the remaining ~210s of the old 300s timeout).
+HTTP_TIMEOUT = httpx.Timeout(90.0, connect=30.0)
 
-# ----------------------- Env var parsing (Q#5) -----------------------
+# Single source of truth for the version string. Used by both the FastAPI app
+# metadata (visible at /docs, /openapi.json) and the / endpoint.
+__version__ = "1.4.0"
+
+# ----------------------- Env var parsing -----------------------
 
 def _parse_int_env(name: str, default: int, min_val: int = 1) -> int:
     """Parse an int env var with validation; fall back to default on bad input."""
@@ -115,7 +126,7 @@ def _parse_float_env(name: str, default: float, min_val: float = 0.0) -> float:
 MAX_CONCURRENT = _parse_int_env("MAX_CONCURRENT", 10, min_val=1)
 QUEUE_TIMEOUT = _parse_float_env("QUEUE_TIMEOUT", 5.0, min_val=0.0)
 
-# ----------------------- Security config (Sec #1, Sec #2) -----------------------
+# ----------------------- Security config -----------------------
 # Optional API key(s). Comma-separated. If empty, no auth required (open proxy).
 #   export API_KEYS="key1,key2,key3"
 _API_KEYS_RAW = os.environ.get("API_KEYS", "").strip()
@@ -125,20 +136,20 @@ API_KEYS: set[str] = {k.strip() for k in _API_KEYS_RAW.split(",") if k.strip()} 
 #   export ADMIN_TOKEN="my-secret-admin-token"
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 
-# Input size limits (Sec #3)
+# Input size limits (DoS protection)
 MAX_MESSAGES = _parse_int_env("MAX_MESSAGES", 1000, min_val=1)
 MAX_CONTENT_CHARS = _parse_int_env("MAX_CONTENT_CHARS", 1_000_000, min_val=1024)
 
 app = FastAPI(
     title="Hy3 OpenAI-Compatible API",
-    version="1.2.0",
+    version=__version__,
     description="OpenAI-compatible proxy for Tencent Hy3 295B MoE via HuggingFace Gradio API.",
 )
 
 # CORS — allow the Next.js admin panel (and any OpenAI client) to call this API.
 # Configure allowed origins via ADMIN_ORIGIN env var (default: permissive for dev).
-# Bug #2: "*" + credentials=true is invalid per CORS spec; browsers block
-# credentialed requests when origin is "*". Use two distinct configurations.
+# "*" + credentials=true is invalid per CORS spec; browsers block credentialed
+# requests when origin is "*". Use two distinct configurations.
 _admin_origin = os.environ.get("ADMIN_ORIGIN", "*")
 if _admin_origin == "*":
     # Wildcard mode — no credentials (spec-compliant)
@@ -174,7 +185,10 @@ class ConcurrencyLimiter:
         self.max_concurrent = max_concurrent
         self.queue_timeout = queue_timeout
         self._sem = asyncio.Semaphore(max_concurrent)
-        # Stats counters (all best-effort; not strictly atomic but fine for observability)
+        # Stats counters. Under single-threaded asyncio, increments/decrements
+        # between await points are atomic from the event loop's perspective, so
+        # these are safe without explicit locking. peak_active may briefly lag
+        # under concurrent acquire() calls, but that's acceptable for observability.
         self.active = 0
         self.total_acquired = 0
         self.total_rejected = 0
@@ -185,12 +199,15 @@ class ConcurrencyLimiter:
 
     async def acquire(self) -> bool:
         """
-        Try to acquire a slot within queue_timeout. Returns True on success.
-        Bug #4/Q#13: clean non-blocking path that doesn't rely on the 1ms hack.
+        Try to acquire a slot within queue_timeout. Returns True on success,
+        False if the queue expired (caller should return 503).
+
+        For non-blocking mode (queue_timeout <= 0), uses a 1ms timeout as an
+        approximation of "immediate" — asyncio.Semaphore has no try-acquire that
+        can distinguish "available now" from "became available in 1ms", but the
+        1ms ceiling is negligible in practice. For normal mode, uses the
+        configured queue_timeout.
         """
-        # For non-blocking mode (queue_timeout <= 0), use a tiny 1ms timeout
-        # to bridge the race between locked() check and acquire(). For normal
-        # mode, use the configured timeout.
         timeout = self.queue_timeout if self.queue_timeout > 0 else 0.001
         try:
             await asyncio.wait_for(self._sem.acquire(), timeout=timeout)
@@ -204,30 +221,20 @@ class ConcurrencyLimiter:
         return True
 
     def release(self, *, errored: bool = False) -> None:
-        # Bug #4: guard against active counter underflow on double-release.
-        # Also guard the completed/errors counters so total_acquired ==
-        # total_completed + total_errors holds even under double-release.
+        # Guard against active counter underflow on double-release. If active is
+        # already 0, this release is spurious — log and return without touching
+        # the semaphore (it's already at max capacity).
         if self.active <= 0:
             log_event("warning", "limiter.release_underflow", active=self.active)
-            # Don't increment any counter — this release is spurious.
-            # Still try to release the underlying semaphore (defensive).
-            try:
-                self._sem.release()
-            except ValueError:
-                pass
             return
         self.active -= 1
-        # Bug #5: an errored request should NOT count as 'completed'; track
-        # errors separately so total_acquired == total_completed + total_errors
+        # An errored request should NOT count as 'completed'; track errors
+        # separately so total_acquired == total_completed + total_errors.
         if errored:
             self.total_errors += 1
         else:
             self.total_completed += 1
-        try:
-            self._sem.release()
-        except ValueError:
-            # Semaphore already at max — ignore (defensive against double-release)
-            log_event("warning", "limiter.release_overflow")
+        self._sem.release()
 
     def stats(self) -> dict:
         return {
@@ -252,7 +259,10 @@ limiter = ConcurrencyLimiter(MAX_CONCURRENT, QUEUE_TIMEOUT)
 
 class ChatMessage(BaseModel):
     role: str
-    content: Optional[str] = None
+    # Accept str OR list of parts (OpenAI multimodal format, e.g.
+    # [{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {...}}]).
+    # When a list is passed, we extract text parts for the upstream Hy3 call.
+    content: Optional[Union[str, list]] = None
     name: Optional[str] = None
     tool_calls: Optional[list] = None
     tool_call_id: Optional[str] = None
@@ -268,10 +278,13 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     tools: Optional[list] = None
     tool_choice: Optional[Any] = None
-    # Bug #8: think_level must be None (not DEFAULT_THINK_LEVEL) so we can
-    # distinguish "user explicitly set no_think" from "user did not set it".
-    # The hy3-think model only overrides when think_level is None.
+    # think_level must be None (not DEFAULT_THINK_LEVEL) so we can distinguish
+    # "user explicitly set no_think" from "user did not set it". The hy3-think
+    # model only overrides when think_level is None.
     think_level: Optional[str] = None
+    # The following fields are accepted for OpenAI spec compatibility but are
+    # NOT forwarded to upstream Hy3 (it doesn't support them). They are silently
+    # ignored. If Hy3 adds support in the future, wire them up in build_payload().
     stop: Optional[Any] = None
     n: Optional[int] = 1
     user: Optional[str] = None
@@ -280,13 +293,13 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: Optional[dict] = None
     seed: Optional[int] = None
 
-    # Sec #3: input size limits to prevent DoS via huge payloads
+    # Input size limits to prevent DoS via huge payloads
     @field_validator("messages")
     @classmethod
     def _validate_messages_size(cls, v):
         if len(v) > MAX_MESSAGES:
             raise ValueError(f"Too many messages (max {MAX_MESSAGES})")
-        total_chars = sum(len(m.content or "") for m in v)
+        total_chars = sum(len(_content_to_str(m.content)) for m in v)
         if total_chars > MAX_CONTENT_CHARS:
             raise ValueError(
                 f"Total message content too large ({total_chars} chars, max {MAX_CONTENT_CHARS})"
@@ -303,8 +316,40 @@ class ChatCompletionRequest(BaseModel):
             raise ValueError(f"think_level must be one of {allowed}, got {v!r}")
         return v
 
+    @field_validator("n")
+    @classmethod
+    def _validate_n(cls, v):
+        # Hy3 only supports n=1 (single completion). Reject n>1 explicitly so
+        # clients get a clear error instead of silently receiving 1 choice.
+        if v is not None and v != 1:
+            raise ValueError(f"n must be 1 (Hy3 does not support multiple completions), got {v}")
+        return v
+
 
 # ----------------------- Helpers -----------------------
+
+
+def _content_to_str(content: Optional[Union[str, list]]) -> str:
+    """Convert OpenAI message content (str or list of parts) to a plain string.
+
+    OpenAI's multimodal format passes content as a list of parts, e.g.:
+      [{"type": "text", "text": "hello"}, {"type": "image_url", "image_url": {...}}]
+    Hy3 only accepts a string, so we extract and concatenate all text parts.
+    Non-text parts (images, audio) are silently dropped (Hy3 doesn't support them).
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(p.get("text", ""))
+            elif isinstance(p, str):
+                parts.append(p)
+        return "\n".join(parts)
+    return str(content)
 
 
 def messages_to_hy3(messages: list[ChatMessage]) -> tuple[str, str, list]:
@@ -319,23 +364,43 @@ def messages_to_hy3(messages: list[ChatMessage]) -> tuple[str, str, list]:
     history: list = []
     last_user_msg = ""
 
-    # Use the last system message as the system prompt
+    # Concatenate all system messages (OpenAI convention). Use _content_to_str
+    # to handle multimodal list content.
     non_system: list[ChatMessage] = []
+    system_parts: list[str] = []
     for m in messages:
         if m.role == "system":
-            system_prompt = m.content or ""
+            s = _content_to_str(m.content)
+            if s:
+                system_parts.append(s)
         else:
             non_system.append(m)
+    system_prompt = "\n".join(system_parts)
 
     if non_system:
-        # The final message is treated as the current prompt; everything before
-        # it is the conversation history.
+        # The final user message is treated as the current prompt; everything before
+        # it becomes the conversation history. If the last message is not from the user
+        # (e.g. assistant continuation), find the most recent user message.
         last = non_system[-1]
-        last_user_msg = last.content or ""
-        prior = non_system[:-1]
+        if last.role == "user":
+            last_user_msg = _content_to_str(last.content)
+            prior = non_system[:-1]
+        else:
+            # Last message is not from user (e.g. assistant/tool). Find the MOST RECENT
+            # user message by scanning in reverse; everything else goes to history.
+            prior = list(non_system)  # shallow copy; we'll extract the prompt from it
+            for i in range(len(prior) - 1, -1, -1):
+                if prior[i].role == "user" and _content_to_str(prior[i].content).strip():
+                    last_user_msg = _content_to_str(prior[i])
+                    del prior[i]
+                    break
+            # If we never found a user message, use the last message as the prompt
+            if not last_user_msg:
+                last_user_msg = _content_to_str(last.content)
+                prior = prior[:-1] if prior and prior[-1] is last else prior
 
         for m in prior:
-            entry: dict = {"role": m.role, "content": m.content or ""}
+            entry: dict = {"role": m.role, "content": _content_to_str(m.content)}
             # Preserve assistant tool_calls in history so the model retains context
             if m.role == "assistant" and m.tool_calls:
                 entry["tool_calls"] = m.tool_calls
@@ -382,11 +447,11 @@ async def call_hy3_stream(
     Instrumented with detailed logging at every step.
     """
     t_post_start = time.perf_counter()
-    # Q#1: Extract payload fields once, then log — readable and avoids triple `.get()`
-    data = payload.get("data", []) or []
-    msg_field = data[0] if len(data) > 0 else ""
-    history_field = data[2] if len(data) > 2 else []
-    tools_str = data[8] if len(data) > 8 else "[]"
+    # Extract payload fields once, then log — readable and avoids triple .get()
+    payload_data = payload.get("data", [])
+    msg_field = payload_data[0] if len(payload_data) > 0 else ""
+    history_field = payload_data[2] if len(payload_data) > 2 else []
+    tools_str = payload_data[8] if len(payload_data) > 8 else "[]"
     try:
         tools_count = len(json.loads(tools_str)) if isinstance(tools_str, str) else 0
     except (json.JSONDecodeError, TypeError):
@@ -402,6 +467,9 @@ async def call_hy3_stream(
         tools_count=tools_count,
     )
 
+    # A new AsyncClient per request. For high-throughput deployments, a shared
+    # client created in the FastAPI lifespan and stored on app.state would reduce
+    # TCP/TLS overhead — but per-request is simpler and avoids lifespan complexity.
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         # Step 1: get event_id
         try:
@@ -528,7 +596,7 @@ async def call_hy3_stream(
                         if payload_str in ("", "null", "[DONE]"):
                             continue
                         try:
-                            data = json.loads(payload_str)
+                            sse_data = json.loads(payload_str)
                         except json.JSONDecodeError as e:
                             log_event(
                                 "warning",
@@ -550,7 +618,7 @@ async def call_hy3_stream(
                                 chunk_index=chunk_count,
                                 ttfb_ms=first_chunk_latency_ms,
                             )
-                        yield data
+                        yield sse_data
 
                 stream_total_ms = round((time.perf_counter() - t_stream_start) * 1000, 1)
                 if record:
@@ -597,7 +665,8 @@ def parse_hy3_data(data: list) -> tuple[str, str, list, list]:
     inner = data[0]
     if not isinstance(inner, list) or not inner:
         return "", "", [], []
-    resp = inner[0] if len(inner) > 0 else ""
+    # `not inner` above guarantees len(inner) > 0, so inner[0] is safe.
+    resp = inner[0] if inner[0] else ""
     think = inner[1] if len(inner) > 1 and inner[1] else ""
     tools = inner[2] if len(inner) > 2 and inner[2] else []
     hist = inner[3] if len(inner) > 3 and inner[3] else []
@@ -613,6 +682,7 @@ def make_chunk(
     role: Optional[str] = None,
     tool_calls: Optional[list] = None,
     finish_reason: Optional[str] = None,
+    created: Optional[int] = None,
 ) -> dict:
     delta: dict = {}
     if role:
@@ -626,7 +696,9 @@ def make_chunk(
     return {
         "id": completion_id,
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
+        # Reuse the same created timestamp across all chunks in this completion
+        # so clients see a consistent value (matches OpenAI behavior).
+        "created": created if created is not None else int(time.time()),
         "model": model,
         "choices": [
             {
@@ -639,7 +711,7 @@ def make_chunk(
 
 
 def _tool_call_to_openai(tc: dict, index: Optional[int] = None) -> dict:
-    """Convert a single Hy3 tool_call to OpenAI format. Shared helper (Q#2)."""
+    """Convert a single Hy3 tool_call to OpenAI format. Shared helper."""
     fn = tc.get("function", {}) if isinstance(tc, dict) else {}
     args = fn.get("arguments", "{}")
     if not isinstance(args, str):
@@ -673,7 +745,7 @@ def make_tool_call_delta(tool_calls: list) -> list:
 async def root():
     return {
         "service": "Hy3 OpenAI-Compatible API",
-        "version": "1.3.0",
+        "version": __version__,
         "endpoints": [
             "/",
             "/health",
@@ -682,6 +754,7 @@ async def root():
             "/v1/chat/completions",
             "/admin/logs (requires ADMIN_TOKEN)",
             "/admin/requests (requires ADMIN_TOKEN)",
+            "/admin/requests/{id} (requires ADMIN_TOKEN)",
             "/admin/logs/summary (requires ADMIN_TOKEN)",
         ],
         "models": ["hy3", "hy3-think"],
@@ -699,12 +772,24 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Liveness/readiness probe for container orchestrators (Render, Fly, K8s)."""
+    """Liveness/readiness probe for container orchestrators (Render, Fly, K8s).
+
+    Returns 503 when the limiter reports more active requests than max_concurrent
+    (which should never happen under normal operation — it indicates a counter bug
+    or a slot leak). Also returns 503 when total_errors exceeds 50% of total_acquired
+    with at least 10 acquired, indicating systemic upstream failures.
+    """
     s = limiter.stats()
-    healthy = s["active_requests"] <= s["max_concurrent"]
+    overflow = s["active_requests"] > s["max_concurrent"]
+    error_rate_high = (
+        s["total_acquired"] >= 10
+        and s["total_errors"] > s["total_acquired"] * 0.5
+    )
+    healthy = not overflow and not error_rate_high
+    status = "ok" if healthy else ("overloaded" if overflow else "degraded")
     return JSONResponse(
         status_code=200 if healthy else 503,
-        content={"status": "ok" if healthy else "overloaded", **s},
+        content={"status": status, **s},
     )
 
 
@@ -738,15 +823,25 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
-    # Sec #2: optional API key check
+    # Optional API key check
     if API_KEYS:
         auth = request.headers.get("authorization", "")
         token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
         # Also allow raw API key in x-api-key header (some clients use this)
         if not token:
             token = request.headers.get("x-api-key", "").strip()
-        if token not in API_KEYS:
-            log_event("warning", "request.unauthorized", path="/v1/chat/completions", client_ip=request.client.host if request.client else "unknown")
+        # use constant-time comparison to prevent timing attacks. Compare
+        # against each configured key with hmac.compare_digest so attackers cannot
+        # distinguish "valid prefix" from "invalid" via response timing.
+        authorized = any(hmac.compare_digest(token, k) for k in API_KEYS)
+        if not authorized:
+            client_ip = request.client.host if request.client else "unknown"
+            log_event(
+                "warning",
+                "request.unauthorized",
+                path="/v1/chat/completions",
+                client_ip=client_ip,
+            )
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     # Per-request ID + record for tracing through the entire pipeline
@@ -762,13 +857,26 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     record.stream = req.stream
     record.has_tools = bool(req.tools)
     record.message_count = len(req.messages)
-    record.think_level = req.think_level or DEFAULT_THINK_LEVEL
     # Find last user message for preview
     for m in reversed(req.messages):
-        if m.role == "user" and m.content:
-            record.user_message_preview = m.content[:100]
-            break
+        if m.role == "user":
+            s = _content_to_str(m.content)
+            if s:
+                record.user_message_preview = s[:100]
+                break
     record.has_history = len(req.messages) > 1
+
+    # Resolve the final think_level BEFORE logging request.start so the log shows
+    # the actual value sent upstream (was previously logged as the pre-override
+    # default, which was misleading for model=hy3-think + think_level=None).
+    # hy3-think overrides think_level only when the user did NOT explicitly set it.
+    # Using None as sentinel (set in Pydantic model), we can distinguish "explicit
+    # no_think" from "not set".
+    if req.think_level is None:
+        think_level = "high" if req.model == "hy3-think" else DEFAULT_THINK_LEVEL
+    else:
+        think_level = req.think_level
+    record.think_level = think_level
 
     log_event(
         "info",
@@ -786,21 +894,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         user_msg_preview=record.user_message_preview,
     )
 
-    # Bug #8: hy3-think overrides think_level only when the user did NOT explicitly set it.
-    # Using None as sentinel (set in Pydantic model), we can distinguish "explicit no_think"
-    # from "not set".
-    if req.think_level is None:
-        think_level = "high" if req.model == "hy3-think" else DEFAULT_THINK_LEVEL
-        record.think_level = think_level
-    else:
-        think_level = req.think_level
-        record.think_level = req.think_level
-
     msg, sys_prompt, history = messages_to_hy3(req.messages)
-    # Bug #7: validation must accept any message flow that includes a user turn
-    # somewhere in the conversation, not just a non-empty last message. Tool
-    # result round-trips legitimately end with role=tool and content may be null.
-    has_user_msg = any(m.role == "user" and (m.content or "").strip() for m in req.messages)
+    # Validation must accept any message flow that includes a user turn somewhere
+    # in the conversation, not just a non-empty last message. Tool result
+    # round-trips legitimately end with role=tool and content may be null.
+    has_user_msg = any(m.role == "user" and _content_to_str(m.content).strip() for m in req.messages)
     if not msg and not has_user_msg:
         log_event(
             "warning",
@@ -891,8 +989,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
                 "X-Max-Concurrent": str(MAX_CONCURRENT),
+                "X-Active-Requests": str(limiter.active),
                 "X-Request-Id": request_id,
             },
         )
@@ -940,11 +1038,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     record.response_chars = len(final_resp)
     record.response_thinking_chars = len(final_think)
     record.response_tool_calls = len(final_tools)
-    record.finish_reason = "tool_calls" if final_tools else "stop"
+    finish_reason = "tool_calls" if final_tools else "stop"
+    record.finish_reason = finish_reason
     record.status_code = 200
     record.finalize()
 
-    # Q#4: compute duration directly instead of building a full to_dict() just for one field
+    # Compute duration directly instead of building a full to_dict() just for one field
     duration_ms = round((record.finished_at - record.started_at) * 1000, 1)
     log_event(
         "info",
@@ -964,11 +1063,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if final_tools:
         message["tool_calls"] = make_tool_call_objects(final_tools)
 
-    finish_reason = "tool_calls" if final_tools else "stop"
-
-    # Q#3: estimate token usage (4 chars ≈ 1 token heuristic). Real counts
-    # require a tokenizer; this is good enough for budget tracking.
-    prompt_chars = sum(len(m.content or "") for m in req.messages)
+    # Estimate token usage (4 chars ≈ 1 token heuristic). Real counts require a
+    # tokenizer; this is good enough for budget tracking.
+    prompt_chars = sum(len(_content_to_str(m.content)) for m in req.messages)
     completion_chars = len(final_resp) + len(final_think)
     prompt_tokens = prompt_chars // 4
     completion_tokens = completion_chars // 4
@@ -997,15 +1094,22 @@ async def stream_openai(
     completion_id: str,
     model: str,
     payload: dict,
-    limiter: Optional[ConcurrencyLimiter] = None,
+    limiter: ConcurrencyLimiter,
     request_id: Optional[str] = None,
     record: Optional[RequestRecord] = None,
 ):
-    """Yield OpenAI-format SSE chunks. Releases the limiter slot in finally."""
+    """Yield OpenAI-format SSE chunks. Releases the limiter slot in finally.
+
+    `limiter` is required — the caller must have already acquired a slot, and
+    this function releases it in the finally block. Passing None would leak
+    the slot, so the parameter is mandatory.
+    """
     last_resp_len = 0
     last_think_len = 0
     final_tools: Optional[list] = None
     errored = False
+    # capture created timestamp once and reuse across all chunks (OpenAI behavior)
+    created_ts = int(time.time())
 
     log_event(
         "info",
@@ -1016,7 +1120,7 @@ async def stream_openai(
     )
 
     # Initial role chunk
-    yield f"data: {json.dumps(make_chunk(completion_id, model, role='assistant'))}\n\n"
+    yield f"data: {json.dumps(make_chunk(completion_id, model, role='assistant', created=created_ts))}\n\n"
 
     try:
         async for data in call_hy3_stream(payload, request_id=request_id, record=record):
@@ -1025,7 +1129,7 @@ async def stream_openai(
             # Emit thinking deltas (as reasoning_content, OpenAI o1-style)
             if think and len(think) > last_think_len:
                 chunk = make_chunk(
-                    completion_id, model, reasoning=think[last_think_len:]
+                    completion_id, model, reasoning=think[last_think_len:], created=created_ts
                 )
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 last_think_len = len(think)
@@ -1035,7 +1139,7 @@ async def stream_openai(
             # Emit response deltas
             if resp and len(resp) > last_resp_len:
                 chunk = make_chunk(
-                    completion_id, model, content=resp[last_resp_len:]
+                    completion_id, model, content=resp[last_resp_len:], created=created_ts
                 )
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 last_resp_len = len(resp)
@@ -1048,13 +1152,13 @@ async def stream_openai(
         # Emit tool calls at the end if any
         if final_tools:
             tc_delta = make_tool_call_delta(final_tools)
-            yield f"data: {json.dumps(make_chunk(completion_id, model, tool_calls=tc_delta), ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps(make_chunk(completion_id, model, finish_reason='tool_calls'))}\n\n"
+            yield f"data: {json.dumps(make_chunk(completion_id, model, tool_calls=tc_delta, created=created_ts), ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps(make_chunk(completion_id, model, finish_reason='tool_calls', created=created_ts))}\n\n"
             if record:
                 record.response_tool_calls = len(final_tools)
                 record.finish_reason = "tool_calls"
         else:
-            yield f"data: {json.dumps(make_chunk(completion_id, model, finish_reason='stop'))}\n\n"
+            yield f"data: {json.dumps(make_chunk(completion_id, model, finish_reason='stop', created=created_ts))}\n\n"
             if record:
                 record.finish_reason = "stop"
 
@@ -1071,25 +1175,6 @@ async def stream_openai(
             tool_calls=len(final_tools or []),
             finish_reason=record.finish_reason if record else None,
         )
-    except httpx.HTTPStatusError as e:
-        # Bug #6: This block is no longer dead. We added raise_for_status() in
-        # call_hy3_stream so this handler will actually fire on HTTP errors from
-        # the upstream. Previously it never triggered because call_hy3_stream
-        # raised HTTPException instead.
-        errored = True
-        err = {
-            "error": {
-                "message": f"Hy3 upstream error: {e.response.status_code} {e.response.text[:200]}",
-                "type": "upstream_error",
-            }
-        }
-        yield f"data: {json.dumps(err)}\n\n"
-        yield "data: [DONE]\n\n"
-        if record:
-            record.status_code = 502
-            record.error = f"upstream HTTP {e.response.status_code}"
-            record.finalize()
-        log_event("error", "stream.upstream_error", request_id=request_id, error=str(e)[:200])
     except HTTPException as e:
         errored = True
         err = {"error": {"message": str(e.detail), "type": "upstream_error"}}
@@ -1113,13 +1198,13 @@ async def stream_openai(
     finally:
         # ALWAYS release the limiter slot — even on client disconnect.
         # Without this, an aborted stream would leak the slot forever.
-        if limiter is not None:
-            limiter.release(errored=errored)
+        # limiter is guaranteed non-None (required parameter).
+        limiter.release(errored=errored)
 
 
 # ----------------------- Admin Endpoints -----------------------
 
-# Sec #1: All /admin/* endpoints require ADMIN_TOKEN. If unset, endpoints return 404
+# All /admin/* endpoints require ADMIN_TOKEN. If unset, endpoints return 404
 # (hide existence from attackers).
 def _require_admin(request: Request):
     if not ADMIN_TOKEN:
@@ -1128,7 +1213,8 @@ def _require_admin(request: Request):
     token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
     if not token:
         token = request.headers.get("x-admin-token", "").strip()
-    if token != ADMIN_TOKEN:
+    # use constant-time comparison to prevent timing attacks on admin token.
+    if not hmac.compare_digest(token, ADMIN_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -1146,13 +1232,14 @@ async def admin_logs(
     Newest first.
     """
     _require_admin(request)
-    # Bug #10: call get_recent_logs ONCE per filter set, not 3 times.
-    all_logs = get_recent_logs(limit=10000)
+    # call get_recent_logs ONCE — use get_log_summary() for the total count
+    # instead of fetching all logs just to count them.
     filtered = get_recent_logs(
         limit=limit, level=level, request_id=request_id, event=event
     )
+    total = get_log_summary()["total_logs"]
     return {
-        "total": len(all_logs),
+        "total": total,
         "returned": len(filtered),
         "filters": {"level": level, "request_id": request_id, "event": event, "limit": limit},
         "logs": filtered,
@@ -1163,11 +1250,12 @@ async def admin_logs(
 async def admin_requests(request: Request, limit: int = 50, errors_only: bool = False):
     """Return recent request records (newest first)."""
     _require_admin(request)
-    # Bug #10: same fix — call once per filter set.
-    all_reqs = get_recent_requests(limit=10000)
+    # call get_recent_requests ONCE — REQUEST_BUFFER is capped at 200, so
+    # use get_log_summary() for the total count instead of fetching all just to count.
     filtered = get_recent_requests(limit=limit, errors_only=errors_only)
+    total = get_log_summary()["total_requests_tracked"]
     return {
-        "total_tracked": len(all_reqs),
+        "total_tracked": total,
         "returned": len(filtered),
         "filters": {"limit": limit, "errors_only": errors_only},
         "requests": filtered,
@@ -1185,9 +1273,8 @@ async def admin_logs_summary(request: Request):
 async def admin_request_detail(request: Request, request_id: str):
     """Get a single request record + all log entries for it."""
     _require_admin(request)
-    # Bug #11: REQUEST_BUFFER maxes at 200, so limit=10000 is misleading. Use the
-    # documented buffer cap so the API contract is honest.
-    requests = [r for r in get_recent_requests(limit=10000) if r["request_id"] == request_id]
+    # REQUEST_BUFFER maxes at 200, so use the actual buffer cap.
+    requests = [r for r in get_recent_requests(limit=200) if r["request_id"] == request_id]
     logs = get_recent_logs(limit=500, request_id=request_id)
     if not requests and not logs:
         raise HTTPException(status_code=404, detail=f"Request {request_id} not found")
@@ -1212,7 +1299,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("PORT", "8000")),
+        default=_parse_int_env("PORT", 8000, min_val=1),
         help="Bind port (default: 8000 or $PORT)",
     )
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload")

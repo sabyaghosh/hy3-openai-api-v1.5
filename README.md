@@ -24,7 +24,25 @@ A production-ready OpenAI-compatible API proxy for [Tencent Hy3](https://hugging
 
 ---
 
-## 📦 What's New in v1.3.0 (Bug-Fix Release)
+## 📦 What's New
+
+### v1.4.0 (Review-Fix Release)
+
+Follow-up fix release addressing issues found in a post-1.3.0 code review:
+
+- **Timing-safe auth** — API key and admin token validation now use `hmac.compare_digest()` to prevent timing side-channel attacks
+- **Multimodal content** — `messages[].content` now accepts `str | list` (OpenAI multimodal format); text parts are extracted, non-text parts dropped
+- **Multiple system messages** — concatenated (OpenAI convention) instead of silently overwritten
+- **`/health` detects degradation** — returns 503 on counter overflow or high upstream error rate (>50% of last 10+ requests)
+- **`hy3.sh` curl timeouts** — POST (30s) and stream GET (300s) no longer hang forever on unresponsive upstream
+- **`hy3.sh` stderr separation** — curl errors no longer mixed into SSE data (was breaking the JSON parser)
+- **Dockerfile HEALTHCHECK** — standalone `docker run` users now get container health status
+- **`render.yaml` security placeholders** — commented-out `API_KEYS`/`ADMIN_TOKEN` remind users to set auth
+- **Version single source of truth** — `__version__` constant shared between FastAPI app and `/` endpoint
+- **Dead `httpx.HTTPStatusError` handler removed** — v1.3.0 changelog falsely claimed it was reactivated
+- See [CHANGELOG.md](CHANGELOG.md) for the full list of 18 fixes
+
+### v1.3.0 (Bug-Fix Release)
 
 This version includes **25 surgical fixes** over the original `hy3-openai-api`. Key improvements:
 
@@ -234,7 +252,7 @@ resp = client.chat.completions.create(
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/` | GET | — | Service info |
-| `/health` | GET | — | Liveness probe — returns 503 if `active_requests > max_concurrent` |
+| `/health` | GET | — | Liveness probe — returns 503 if `active_requests > max_concurrent` (counter overflow) OR if `total_errors > 50%` of `total_acquired` (with ≥10 total acquired, indicating systemic upstream failures) |
 | `/stats` | GET | — | Runtime counters (active, peak, rejected, completed) |
 | `/v1/models` | GET | — | OpenAI models list |
 | `/v1/chat/completions` | POST | `API_KEYS` (if set) | OpenAI chat completion (streaming + non-streaming) |
@@ -389,10 +407,6 @@ No API key. No auth. HF routes through their inference provider network (deepinf
 python server.py --port 8000 --reload
 ```
 
-### Run tests
-
-See the test scripts in the [`scripts/`](scripts/) directory for end-to-end verification of all endpoints, streaming, tool calling, and edge cases.
-
 ### Project structure
 
 ```
@@ -405,6 +419,8 @@ hy3-openai-api/
 ├── render.yaml            # Render Blueprint for one-click deploy
 ├── requirements.txt       # Pinned Python dependencies
 ├── DEPLOY.md              # Platform-specific deployment guides
+├── CHANGELOG.md           # Version history
+├── LICENSE                # MIT
 └── README.md              # This file
 ```
 

@@ -3,15 +3,15 @@ Structured logging + in-memory ring buffer for the Hy3 OpenAI-compatible API.
 
 Provides:
   - log_event(level, event, **fields) — structured log to stdout + ring buffer
-  - RequestTracker — per-request context manager that captures full lifecycle
+  - RequestRecord — per-request lifecycle record (start, upstream calls, finish)
   - get_recent_logs(limit, level, request_id) — query the ring buffer
   - get_recent_requests(limit) — query summarized request records
 
-The ring buffer is bounded (default 1000 entries) and process-local.
-For production multi-instance deployments, replace with Redis/Postgres.
+The ring buffer is bounded (LOG_BUFFER=2000 entries, REQUEST_BUFFER=200 entries)
+and process-local. For production multi-instance deployments, replace with
+Redis/Postgres.
 """
 
-import asyncio  # noqa: F401  (retained for backward compat with downstream imports)
 import json
 import logging
 import os
@@ -43,8 +43,6 @@ if not logger.handlers:
 BUFFER_SIZE = 2000  # keep last 2000 log entries
 LOG_BUFFER: deque = deque(maxlen=BUFFER_SIZE)
 REQUEST_BUFFER: deque = deque(maxlen=200)  # last 200 request summaries
-
-# Per-request log index: request_id -> list of log entries (built lazily)
 
 
 def _truncate(s: Any, n: int = 500) -> str:
@@ -84,7 +82,10 @@ def log_event(
     }
     LOG_BUFFER.append(entry)
 
-    # Also log to stdout (compact one-liner)
+    # Also log to stdout (compact one-liner).
+    # Note: `if v != ""` filters empty-string field values from the one-liner
+    # to keep it concise. Other falsy values like "0" or "[]" are preserved
+    # because they carry information (e.g., tools_count=0, error=[]).
     fld_str = " ".join(f"{k}={v}" for k, v in entry["fields"].items() if v != "")
     rid = f"[{request_id[:8]}] " if request_id else ""
     msg = f"{rid}{event} {fld_str}".strip()
@@ -113,7 +114,7 @@ class RequestRecord:
         self.finished_at: Optional[float] = None
         self.status_code: Optional[int] = None
         self.error: Optional[str] = None
-        self._finalized = False  # Bug #12: guard against double-finalize
+        self._finalized = False  # guard against double-finalize
         # Request details
         self.model: Optional[str] = None
         self.stream: bool = False
@@ -176,7 +177,7 @@ class RequestRecord:
         }
 
     def finalize(self) -> None:
-        # Bug #12: idempotent — safe to call multiple times
+        # Idempotent — safe to call multiple times.
         if self._finalized:
             return
         self._finalized = True

@@ -9,7 +9,7 @@ services:
     name: hy3-openai-api
     runtime: docker
     plan: free
-    region: oregon
+    region: oregon  # change to your nearest region (e.g. frankfurt, singapore, ohio)
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     autoDeploy: true
@@ -25,3 +25,9 @@ services:
         value: "10"
       - key: QUEUE_TIMEOUT
         value: "5"
+      # security — uncomment and set strong secrets before going live.
+      # Without these, your instance is an open proxy with public admin endpoints.
+      # - key: API_KEYS
+      #   value: "change-me-to-a-long-random-string"
+      # - key: ADMIN_TOKEN
+      #   value: "change-me-to-a-different-long-random-string"

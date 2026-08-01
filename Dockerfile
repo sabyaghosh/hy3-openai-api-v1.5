@@ -3,7 +3,7 @@ FROM python:3.11.9-slim-bookworm
 # Metadata
 LABEL org.opencontainers.image.title="hy3-openai-api" \
       org.opencontainers.image.description="OpenAI-compatible API proxy for Tencent Hy3 295B MoE via HuggingFace Gradio API" \
-      org.opencontainers.image.source="https://github.com/sabyaghosh/hy3-client" \
+      org.opencontainers.image.source="https://github.com/sabyaghosh/hy3-openai-api" \
       org.opencontainers.image.licenses="MIT"
 
 # Non-root user for security
@@ -15,8 +15,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Copy app code (NOTE: logging_layer.py is imported by server.py — must be included)
-COPY --chown=app:app server.py logging_layer.py hy3.sh tools_example.json README.md ./
+# Copy app code (logging_layer.py is imported by server.py — must be included).
+# Docs are included for reference; they don't affect runtime but are useful
+# when exec-ing into the container.
+COPY --chown=app:app server.py logging_layer.py hy3.sh tools_example.json README.md CHANGELOG.md DEPLOY.md LICENSE ./
 RUN chmod +x hy3.sh
 
 USER app
@@ -25,5 +27,11 @@ EXPOSE 8000
 # Render injects PORT env var. Default to 8000 for local runs.
 ENV PORT=8000 \
     HOST=0.0.0.0
+
+# Add HEALTHCHECK so standalone Docker runs report health status.
+# render.yaml uses healthCheckPath separately; this is for `docker run` users.
+# NOTE: HEALTHCHECK CMD does not expand ${PORT} unless wrapped in sh -c.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD sh -c 'python -c "import os,urllib.request,sys; r=urllib.request.urlopen(\"http://localhost:\"+os.environ.get(\"PORT\",\"8000\")+\"/health\",timeout=3); sys.exit(0 if r.status==200 else 1)" || exit 1'
 
 CMD ["sh", "-c", "uvicorn server:app --host ${HOST} --port ${PORT}"]

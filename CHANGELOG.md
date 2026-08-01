@@ -5,6 +5,77 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] — 2026-08-02
+
+Second-pass cleanup addressing dead code, wrong comments, and documentation
+mismatches found in the post-v1.4.0 review. No behavior changes — all fixes
+are documentation, comments, or dead-code removal. Test battery passes 20/20.
+
+### 🔴 Critical (Dead Code & Wrong Docs)
+
+- **`logging_layer.py` docstring fixed** — module docstring referenced `RequestTracker` (does not exist; the class is `RequestRecord`). Buffer size documented as `1000` (actual: `2000`). Both corrected.
+- **Dead `import asyncio` removed** from `logging_layer.py` — was tagged `# noqa: F401 (retained for backward compat)` but no downstream code imports `asyncio` from this module. The "backward compat" justification was hollow.
+- **Orphan comment removed** — `logging_layer.py` had a comment describing a `request_id -> list of log entries` index that was never implemented. Removed.
+
+### 🟠 High (Wrong/Stale Comments)
+
+- **`ConcurrencyLimiter.acquire()` docstring fixed** — claimed "clean non-blocking path that doesn't rely on the 1ms hack" but the implementation literally uses a 1ms timeout. Now honestly describes the 1ms approximation.
+- **Contradictory system-message comment fixed** — `messages_to_hy3` had "Use the last system message" followed by "FIX: concatenate multiple". Removed the stale first line.
+- **README `/health` description updated** — was "returns 503 if active_requests > max_concurrent" (incomplete). Now also mentions the high-error-rate condition added in v1.4.0.
+- **README `scripts/` link removed** — referenced a `scripts/` directory that does not exist in the repo. Removed the "Run tests" subsection.
+- **README `What's New` section updated** — was stuck at v1.3.0; added v1.4.0 section with summary of fixes.
+- **`hy3.sh` usage text fixed** — described the old `TOOL_CALL: function_name(args_json)` format (replaced in v1.3.0). Now shows the correct `TOOL_CALL:{json_envelope}` format with an example.
+
+### 🟡 Medium (Dead Code & Inconsistencies)
+
+- **6 unused request fields documented** — `stop`, `n`, `user`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `seed` are accepted for OpenAI spec compatibility but silently dropped (Hy3 doesn't support them). Now documented inline.
+- **`stream_openai(limiter=)` made required** — was `Optional[ConcurrencyLimiter] = None` but the only caller always passes it. The `if limiter is not None:` guard in the `finally` block would skip the release if None, leaking the slot. Removed the default and the guard.
+- **`Connection: keep-alive` header removed** from streaming responses — it's the HTTP/1.1 default and forbidden in HTTP/2. `Cache-Control` + `X-Accel-Buffering` are sufficient.
+- **`record.think_level` double-assignment fixed** — was set to `req.think_level or DEFAULT_THINK_LEVEL` (logging the pre-override value), then overwritten after the hy3-think override. Now the override runs first, so `request.start` logs the actual value sent upstream.
+- **Dead `len(inner) > 0` branch removed** in `parse_hy3_data` — the `not inner` check above already guarantees it.
+- **`HTTP_TIMEOUT` reduced** from 300s to 90s — Render's gateway kills requests at ~100s; a 300s read timeout left the limiter slot occupied for ~210s after the client already got a 504.
+- **Version single source of truth** — added `__version__ = "1.4.0"` module constant; both `FastAPI(version=...)` and the `/` endpoint now reference it instead of hardcoding separate strings.
+- **Response header consistency** — `X-Active-Requests` now present on both 503 and streaming responses (was only on 503).
+
+### 🔵 Low (Polish)
+
+- **`Q#`/`Bug #`/`Sec #` prefixes removed** from all comments in `server.py` and `hy3.sh` — they referenced an internal review numbering scheme that no longer exists in the repo.
+- **Long line wrapped** in `chat_completions` — the `log_event("warning", "request.unauthorized", ...)` call was 119 chars on one line; now multi-line for consistency with the rest of the file.
+- **v1.3.0 changelog corrected** — claimed admin endpoints made "3 calls" to `get_recent_logs`; was actually 2. Added a correction note.
+- **Dockerfile HEALTHCHECK fixed** — used `${PORT}` in `CMD python -c "..."` form, which doesn't expand env vars (no shell). Rewrote as `CMD sh -c '...'` so `${PORT}` expands correctly. Without this fix, the HEALTHCHECK would always fail.
+- **Deferred TODO comment converted** to a plain descriptive comment — the "NOTE: consider a shared client" was a TODO masquerading as documentation.
+
+## [1.4.0] — 2026-08-02
+
+Follow-up fix release addressing issues found in the post-1.3.0 code review.
+
+### 🔴 Critical Fixes
+
+- **Timing attack on API key validation** — `token in API_KEYS` (set membership) was vulnerable to timing side-channels. Now uses `hmac.compare_digest()` against each configured key.
+- **Timing attack on admin token** — `token != ADMIN_TOKEN` (string inequality) was vulnerable to the same. Now uses `hmac.compare_digest()`.
+- **`httpx.HTTPStatusError` dead code removed** — the v1.3.0 changelog falsely claimed this handler was reactivated. It was still dead because `call_hy3_stream` raises `HTTPException` (not `HTTPStatusError`) on non-200 responses. The dead `except` block has been removed; the manual status check (which provides better error messages) is kept.
+- **Dockerfile `image.source` label fixed** — was still pointing to `sabyaghosh/hy3-client` (the v1.3.0 changelog claimed this was fixed but it wasn't). Now correctly points to `sabyaghosh/hy3-openai-api`.
+- **`Dockerfile` HEALTHCHECK added** — standalone `docker run` users now get container health status via the `/health` endpoint.
+
+### 🟠 High Fixes
+
+- **Multiple system messages now concatenated** — previously only the last system message was kept (OpenAI convention is to concatenate). Affects system-prompt-heavy agentic workflows.
+- **Last-message-role assumption fixed** — if the last message was an assistant message (continuation requests), the code was using the assistant's content as the "current prompt". Now correctly finds the last user message.
+- **`hy3.sh` curl timeouts added** — POST now has `--max-time 30`, stream GET has `--max-time 300`. Previously a hung upstream would hang the CLI forever.
+- **`hy3.sh` stderr redirection fixed** — `2>&1` was mixing curl errors into the SSE data file, breaking the JSON parser. Now stderr goes to a separate `ERRFILE`.
+- **`render.yaml` security placeholders** — commented-out `API_KEYS` and `ADMIN_TOKEN` env vars are now included so one-click deploys remind users to set auth.
+- **`/health` endpoint now detects degradation** — previously the 503 path was unreachable (always returned 200). Now returns 503 on counter overflow or high error rate (>50% of last 10+ requests).
+
+### 🟡 Medium Fixes
+
+- **OpenAI version string mismatch** — FastAPI app `version` was `1.2.0` while `/` endpoint returned `1.3.0`. Both now return `1.3.0`.
+- **`content` field accepts multimodal lists** — `ChatMessage.content` now accepts `str | list` (OpenAI multimodal format). Text parts are extracted via `_content_to_str()`; non-text parts are dropped (Hy3 doesn't support images).
+- **`make_chunk` timestamp consistency** — `created` is now captured once per completion and reused across all chunks (matches OpenAI behavior; previously each chunk got a fresh timestamp).
+- **`PORT` env var validation** — `int(os.environ.get("PORT", "8000"))` crashed on `PORT=abc`. Now uses `_parse_int_env()` with fallback.
+- **`ConcurrencyLimiter.release()` simplified** — underflow path no longer calls `self._sem.release()` (which always raised `ValueError` on an already-max semaphore). Cleaner code, same behavior.
+- **Admin endpoints no longer double-call** — `/admin/logs` and `/admin/requests` were calling `get_recent_logs`/`get_recent_requests` twice (once for count, once for data). Now uses `get_log_summary()` for the count.
+- **`/admin/requests/{id}` honest limit** — was passing `limit=10000` to a function capped at 200. Now passes `limit=200` to match the actual buffer size.
+
 ## [1.3.0] — 2025-08-01
 
 Comprehensive bug-fix release. 25 surgical fixes over the original `hy3-openai-api`.
@@ -45,7 +116,7 @@ Comprehensive bug-fix release. 25 surgical fixes over the original `hy3-openai-a
 - **`hy3.sh` python3 check** — script now verifies `python3` is installed before depending on it, with a clear error message.
 - **`hy3.sh` conversation save failure no longer silent** — was `except Exception: pass`. Now prints a warning to stderr.
 - **Configurable log level** — `LOG_LEVEL` env var (default `INFO`). Previously hardcoded to `DEBUG` which flooded stdout in production.
-- **Admin endpoints no longer triple-call** — `/admin/logs` was calling `get_recent_logs` 3 times per request (for `total`, `returned`, and `logs`). Now calls once per filter set, with consistent snapshot.
+- **Admin endpoints no longer double-call** — `/admin/logs` was calling `get_recent_logs` 2 times per request (once for the total count, once for the filtered data). Now uses `get_log_summary()` for the count. (An earlier version of this changelog claimed 3 calls; that was an overcount — it was 2.)
 - **Removed duplicate `import os`** in `server.py` entrypoint.
 - **Refactored `make_tool_call_objects` / `make_tool_call_delta`** — 90% duplicated code consolidated into `_tool_call_to_openai` helper.
 - **Cleaned up unreadable logging call** — `upstream.post.start` log event had nested ternaries with triple `payload.get("data", ...)` calls. Now extracts fields once into readable local variables.

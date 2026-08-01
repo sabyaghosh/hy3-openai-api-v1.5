@@ -23,7 +23,7 @@ CONV_ID=""
 RAW=0
 TOOLS_JSON=""
 
-# Q#9: verify python3 is available before we depend on it later
+# Verify python3 is available before we depend on it later
 command -v python3 >/dev/null 2>&1 || {
   echo "Error: python3 is required but not installed" >&2
   exit 1
@@ -45,8 +45,9 @@ Options:
   -h        Help
 
 Tool Calling:
-  Define tools with -f. When the model calls a tool, the script outputs:
-    TOOL_CALL: function_name(args_json)
+  Define tools with -f. When the model calls a tool, the script outputs a
+  JSON envelope to stderr:
+    TOOL_CALL:{"id": "call_abc123", "name": "get_weather", "arguments": "{\"location\": \"Tokyo\"}"}
   Feed tool results back with -c and a tool result message.
 
 Examples:
@@ -93,7 +94,7 @@ fi
 # Load conversation history if -c specified
 HISTORY="null"
 if [[ -n "$CONV_ID" ]]; then
-  # Q#10: sanitize CONV_ID to prevent path traversal (e.g. "../../etc/passwd")
+  # Sanitize CONV_ID to prevent path traversal (e.g. "../../etc/passwd")
   if [[ ! "$CONV_ID" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     echo "Error: conversation ID must be alphanumeric (a-z, 0-9, -, _)" >&2
     exit 1
@@ -140,7 +141,8 @@ print(json.dumps({'data': [msg, sp, hist, tl, temp, mt, tp, pt, json.dumps(tools
 PAYLOAD="$(build_payload)"
 
 # Step 1: POST to get event_id
-RESPONSE=$(curl -sf -X POST "$BASE" \
+# add --max-time to prevent hanging forever if upstream is unresponsive.
+RESPONSE=$(curl -sf --max-time 30 -X POST "$BASE" \
   -H "Content-Type: application/json" \
   -d "$PAYLOAD")
 
@@ -152,12 +154,20 @@ if [[ -z "$EVENT_ID" ]]; then
 fi
 
 # Step 2: Stream and save everything to a temp file, then replay
+# add --max-time to prevent hanging forever on a stalled stream.
 TMPFILE=$(mktemp)
-trap "rm -f '$TMPFILE'" EXIT
+ERRFILE=$(mktemp)
+trap "rm -f '$TMPFILE' '$ERRFILE'" EXIT
 
-# Bug #13: don't swallow curl errors. Capture exit code + check for empty output.
-if ! curl -sf -N "${BASE}/${EVENT_ID}" > "$TMPFILE" 2>&1; then
+# Don't swallow curl errors. Capture exit code + check for empty output.
+# redirect stderr to a separate file (was 2>&1 which mixed errors into the
+# SSE data, breaking the JSON parser). Now errors go to ERRFILE for diagnostics.
+if ! curl -sf --max-time 300 -N "${BASE}/${EVENT_ID}" > "$TMPFILE" 2>"$ERRFILE"; then
   echo "Error: failed to fetch Hy3 stream (curl exit $?)" >&2
+  if [[ -s "$ERRFILE" ]]; then
+    echo "--- curl stderr ---" >&2
+    head -c 500 "$ERRFILE" >&2
+  fi
   if [[ -s "$TMPFILE" ]]; then
     echo "--- Response body ---" >&2
     head -c 500 "$TMPFILE" >&2
@@ -183,7 +193,7 @@ conv_id = os.environ.get('HY3_CONV', '')
 tmpfile = os.environ.get('HY3_TMP', '')
 state_dir = os.environ.get('HY3_STATE', '')
 
-# Bug #15: use `with` to avoid file handle leak
+# Use `with` to avoid file handle leak
 with open(tmpfile, encoding='utf-8') as f:
     lines = f.read().split('\n')
 
@@ -197,8 +207,12 @@ for line in lines:
         payload = line[6:]
         try:
             data = json.loads(payload)
-            _ = data[0][0]
-        except Exception:  # Bug #16: was bare `except:` which catches KeyboardInterrupt
+            # Verify the payload has the expected Hy3 shape: [[resp, think, tools, ...]]
+            # Accessing data[0][0] raises IndexError/TypeError if malformed, which
+            # the except block catches to skip this SSE line.
+            if not isinstance(data, list) or not data or not isinstance(data[0], list):
+                continue
+        except Exception:  # was bare `except:` which catches KeyboardInterrupt
             continue
 
         resp_text = data[0][0] or ''
@@ -233,7 +247,7 @@ if final_data and len(final_data[0]) > 2 and final_data[0][2]:
             name = fn.get('name', 'unknown')
             args = fn.get('arguments', '{}')
             tc_id = tc.get('id', '')
-            # Bug #14: use JSON envelope so colons in args don't break parsing.
+            # Use JSON envelope so colons in args don't break parsing.
             # Old format: TOOL_CALL:id:name:args  (ambiguous if args contains ':')
             # New format: TOOL_CALL:{json}
             envelope = json.dumps({
@@ -259,6 +273,6 @@ if conv_id and final_data and state_dir:
         messages = final_data[0][3]
         with open(os.path.join(state_dir, conv_id + '.json'), 'w', encoding='utf-8') as f:
             json.dump(messages, f, ensure_ascii=False)
-    except Exception as e:  # Q#11: was `pass` — silent failure
+    except Exception as e:  # was `pass` — silent failure
         sys.stderr.write(f'Warning: failed to save conversation state: {e}\n')
 PYEOF
