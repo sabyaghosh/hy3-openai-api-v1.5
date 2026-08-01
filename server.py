@@ -50,18 +50,19 @@ Tool calling:
 
 import argparse
 import asyncio
+from contextlib import asynccontextmanager
 import hmac
 import json
 import os
 import time
 import uuid
-from typing import Any, AsyncIterator, Optional, Union
+from typing import Any, AsyncIterator, Literal, Optional, Union
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from logging_layer import (
     RequestRecord,
@@ -72,14 +73,19 @@ from logging_layer import (
     new_request_id,
 )
 
-HY3_BASE = "https://tencent-Hy3.hf.space/gradio_api/call/chat"
+# Upstream Hy3 Gradio endpoint. Env-tunable so deployments can point at a
+# different Space or self-hosted instance without a code change.
+HY3_BASE = os.environ.get("HY3_BASE", "https://tencent-Hy3.hf.space/gradio_api/call/chat")
 DEFAULT_MODEL = "hy3"
-DEFAULT_MAX_TOKENS = 262144
+# Sane default output cap. The old 262144 (full context window) maximized
+# latency and 504 risk against the read timeout. 4096 is enough for most
+# chat responses; clients needing more can pass max_tokens explicitly.
+DEFAULT_MAX_TOKENS = 4096
 DEFAULT_THINK_LEVEL = "no_think"
 
 # Single source of truth for the version string. Used by both the FastAPI app
 # metadata (visible at /docs, /openapi.json) and the / endpoint.
-__version__ = "1.4.0"
+__version__ = "1.4.4"
 
 # ----------------------- Env var parsing -----------------------
 
@@ -112,7 +118,12 @@ def _parse_float_env(name: str, default: float, min_val: float = 0.0) -> float:
 
 def _parse_bool_env(name: str, default: bool) -> bool:
     raw = os.environ.get(name, str(default)).strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off", ""):
+        return False
+    print(f"Warning: {name}={raw!r} is not a valid bool, using {default}", flush=True)
+    return default
 
 
 # Whether to preserve thinking content in the Hy3 response. Passed as the 8th
@@ -147,6 +158,14 @@ if _API_KEYS_RAW and not API_KEYS:
         "running WITHOUT auth. Check for stray commas or whitespace.",
         flush=True,
     )
+# Loud startup warning when running as an open proxy (no API keys at all).
+if not API_KEYS:
+    print(
+        "WARNING: API_KEYS is not set — running as an OPEN PROXY. "
+        "Anyone who can reach this service can use it without authentication. "
+        "Set API_KEYS to require a Bearer token on /v1/chat/completions.",
+        flush=True,
+    )
 
 # Timing-safe string comparison that tolerates non-ASCII characters.
 # hmac.compare_digest(str, str) raises TypeError on non-ASCII; encoding to
@@ -162,13 +181,17 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 # Input size limits (DoS protection)
 MAX_MESSAGES = _parse_int_env("MAX_MESSAGES", 1000, min_val=1)
 MAX_CONTENT_CHARS = _parse_int_env("MAX_CONTENT_CHARS", 1_000_000, min_val=1024)
+# Reject request bodies larger than this BEFORE reading them (Starlette reads
+# the full body before Pydantic validators run). Default 8MB is generous for
+# any legitimate chat request; a 500MB payload is rejected at 413, not parsed.
+MAX_BODY_BYTES = _parse_int_env("MAX_BODY_BYTES", 8_000_000, min_val=1024)
 
-# Cap on the SSE line buffer to prevent unbounded memory growth from a
-# malformed upstream (e.g. a response with no newline). 10MB is generous —
-# the largest legitimate payload with max_tokens=262144 is well under 2MB.
+# Cap on a single SSE line from upstream. aiter_lines() is unbounded if the
+# upstream sends no newline, so we check each line's length explicitly.
+# Default 10MB — the largest legitimate payload with max_tokens=262144 is
+# well under 2MB.
 SSE_BUFFER_CAP = _parse_int_env("SSE_BUFFER_CAP", 10_000_000, min_val=1024)
 
-from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -177,12 +200,16 @@ async def lifespan(app: FastAPI):
     A shared httpx.AsyncClient eliminates per-request TCP+TLS handshakes to the
     upstream Hy3 host (~100-300ms saved per request at the cost of one open
     connection pool). Created once, closed on shutdown.
+
+    Note: on shutdown, active SSE streams will error rather than complete
+    (aclose() closes the connection pool). Acceptable at this scale.
     """
     app.state.http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
     try:
         yield
     finally:
         await app.state.http_client.aclose()
+
 
 app = FastAPI(
     title="Hy3 OpenAI-Compatible API",
@@ -191,12 +218,54 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# Reject oversized request bodies before they're parsed (413 Payload Too Large).
+# This runs before Pydantic's MAX_MESSAGES/MAX_CONTENT_CHARS validators, which
+# only fire after the full body has been buffered into memory.
+@app.middleware("http")
+async def _limit_body_size(request: Request, call_next):
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > MAX_BODY_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": {
+                        "message": f"Request body too large (max {MAX_BODY_BYTES} bytes)",
+                        "type": "payload_too_large",
+                    }},
+                )
+        except ValueError:
+            pass
+    return await call_next(request)
+
+
+def _client_ip(request: Request) -> str:
+    """Extract the client IP, preferring X-Forwarded-For when behind a proxy.
+
+    On Render/Fly/Cloud Run/Koyeb, request.client.host is the load balancer's
+    IP, not the end user's. X-Forwarded-For gives the real client. Only trust
+    this header when a trusted proxy is in front (the default in production).
+    Set TRUST_PROXY_HEADERS=false to disable and fall back to socket peer.
+    """
+    if TRUST_PROXY_HEADERS:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+# Whether to trust X-Forwarded-For / X-Real-IP headers. Default true because
+# every documented deployment platform puts a proxy in front of this service.
+TRUST_PROXY_HEADERS = _parse_bool_env("TRUST_PROXY_HEADERS", True)
+
 # CORS — allow the Next.js admin panel (and any OpenAI client) to call this API.
 # Configure allowed origins via ADMIN_ORIGIN env var (default: permissive for dev).
+# Supports a single origin or a comma-separated list of origins.
 # "*" + credentials=true is invalid per CORS spec; browsers block credentialed
 # requests when origin is "*". Use two distinct configurations.
-_admin_origin = os.environ.get("ADMIN_ORIGIN", "*")
-if _admin_origin == "*":
+_admin_origin_raw = os.environ.get("ADMIN_ORIGIN", "*")
+if _admin_origin_raw == "*":
     # Wildcard mode — no credentials (spec-compliant)
     app.add_middleware(
         CORSMiddleware,
@@ -206,10 +275,12 @@ if _admin_origin == "*":
         allow_headers=["*"],
     )
 else:
-    # Specific origin — credentials allowed (spec-compliant)
+    # Specific origin(s) — credentials allowed (spec-compliant).
+    # ADMIN_ORIGIN can be a single origin or comma-separated list.
+    _origins = [o.strip() for o in _admin_origin_raw.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[_admin_origin],
+        allow_origins=_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -241,6 +312,11 @@ class ConcurrencyLimiter:
         self.total_errors = 0
         self.peak_active = 0
         self.started_at = time.time()
+        # Rolling window of the last 50 outcomes (True = errored). Used by
+        # /health to detect transient upstream failures without a permanent
+        # 503 brick from a single bad burst (cumulative counters never decay).
+        from collections import deque
+        self._recent_outcomes: deque = deque(maxlen=50)
 
     async def acquire(self) -> bool:
         """
@@ -255,7 +331,7 @@ class ConcurrencyLimiter:
 
         If the client disconnects while queued, asyncio.wait_for raises
         CancelledError (not TimeoutError). We re-raise it so the caller's
-        finally block can finalize the record — but we don't count it as a
+        try/except can finalize the record — but we don't count it as a
         rejection (the client gave up, not the server).
         """
         timeout = self.queue_timeout if self.queue_timeout > 0 else 0.001
@@ -287,6 +363,7 @@ class ConcurrencyLimiter:
             log_event("warning", "limiter.release_underflow", active=self.active)
             return
         self.active -= 1
+        self._recent_outcomes.append(errored)
         # An errored request should NOT count as 'completed'; track errors
         # separately so total_acquired == total_completed + total_errors.
         if errored:
@@ -294,6 +371,13 @@ class ConcurrencyLimiter:
         else:
             self.total_completed += 1
         self._sem.release()
+
+    def recent_error_rate(self) -> tuple[int, float]:
+        """Return (window_size, error_rate) over the last 50 outcomes."""
+        n = len(self._recent_outcomes)
+        if n == 0:
+            return 0, 0.0
+        return n, sum(self._recent_outcomes) / n
 
     def stats(self) -> dict:
         return {
@@ -310,9 +394,7 @@ class ConcurrencyLimiter:
         }
 
 
-from contextlib import asynccontextmanager as _acm
-
-@_acm
+@asynccontextmanager
 async def _slot(limiter: "ConcurrencyLimiter"):
     """Own exactly one limiter slot; release exactly once, no matter how we exit.
 
@@ -325,14 +407,22 @@ async def _slot(limiter: "ConcurrencyLimiter"):
         async with _slot(limiter):
             ...  # do upstream work
 
-    The context manager handles both success and exception paths.
+    Cancellations (client disconnect) are NOT counted as errors — they're
+    client-side give-ups, not server failures. Counting them would inflate
+    the error rate and trip /health's degradation check under normal traffic.
     """
     released = False
     try:
         yield
-    except BaseException:
-        limiter.release(errored=True)
+    except (asyncio.CancelledError, GeneratorExit):
+        # Client gave up; not a server error. Set released=True BEFORE calling
+        # release() so a failure inside release() can't trigger a second release.
         released = True
+        limiter.release(errored=False)
+        raise
+    except BaseException:
+        released = True
+        limiter.release(errored=True)
         raise
     finally:
         if not released:
@@ -346,7 +436,9 @@ limiter = ConcurrencyLimiter(MAX_CONCURRENT, QUEUE_TIMEOUT)
 
 
 class ChatMessage(BaseModel):
-    role: str
+    # Literal catches typos like "usr" or "asistant" at 422 instead of
+    # forwarding garbage to Hy3. "developer" is OpenAI's newer name for system.
+    role: Literal["system", "user", "assistant", "tool", "developer"]
     # Accept str OR list of parts (OpenAI multimodal format, e.g.
     # [{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {...}}]).
     # When a list is passed, we extract text parts for the upstream Hy3 call.
@@ -362,7 +454,9 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage]
     temperature: Optional[float] = None
     top_p: Optional[float] = None
-    max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
+    # ge=1 rejects 0, negative, and (with the explicit is None check below)
+    # ensures max_tokens is always a positive int when forwarded upstream.
+    max_tokens: Optional[int] = Field(DEFAULT_MAX_TOKENS, ge=1)
     stream: bool = False
     tools: Optional[list] = None
     tool_choice: Optional[Any] = None
@@ -468,25 +562,29 @@ def messages_to_hy3(messages: list[ChatMessage]) -> tuple[str, str, list]:
 
     if non_system:
         # The final user message is treated as the current prompt; everything before
-        # it becomes the conversation history. If the last message is not from the user
-        # (e.g. assistant continuation), find the most recent user message.
+        # it becomes the conversation history.
         last = non_system[-1]
         if last.role == "user":
+            # Common case: last message is the user's prompt.
             last_user_msg = _content_to_str(last.content)
             prior = non_system[:-1]
         else:
-            # Last message is not from user (e.g. assistant/tool). Find the MOST RECENT
-            # user message by scanning in reverse; everything else goes to history.
-            prior = list(non_system)  # shallow copy; we'll extract the prompt from it
-            for i in range(len(prior) - 1, -1, -1):
-                if prior[i].role == "user" and _content_to_str(prior[i].content).strip():
-                    last_user_msg = _content_to_str(prior[i].content)
-                    del prior[i]
-                    break
-            # If we never found a user message, use the last message as the prompt
-            if not last_user_msg:
-                last_user_msg = _content_to_str(last.content)
-                prior = prior[:-1] if prior and prior[-1] is last else prior
+            # Last turn is assistant/tool (e.g. tool-result round-trip). Keep
+            # history in chronological order and synthesize the current prompt
+            # from the trailing turn, so tool results are presented as "what just
+            # happened" rather than reordering the conversation (which would
+            # pull a past user question out of sequence and confuse the model).
+            prior = non_system[:-1]
+            tail = _content_to_str(last.content).strip()
+            if last.role == "tool":
+                last_user_msg = (
+                    f"Tool result for call {last.tool_call_id or 'unknown'}:\n{tail}"
+                    if tail else
+                    f"Tool call {last.tool_call_id or 'unknown'} returned no output."
+                )
+            else:
+                # assistant continuation — ask the model to continue.
+                last_user_msg = tail or "Continue."
 
         for m in prior:
             entry: dict = {"role": m.role, "content": _content_to_str(m.content)}
@@ -679,10 +777,23 @@ async def call_hy3_stream(
             chunk_count = 0
             first_chunk_latency_ms: Optional[float] = None
             # Use aiter_lines() for SSE framing — it handles newline splitting
-            # internally and avoids the O(n²) buffer += chunk pattern. The buffer
-            # is also naturally bounded by the HTTP_TIMEOUT if the upstream sends
-            # no newlines (aiter_lines will block until a line or timeout).
+            # internally and avoids the O(n²) buffer += chunk pattern.
+            # aiter_lines() is unbounded if the upstream sends no newline, so we
+            # cap each line's length at SSE_BUFFER_CAP to prevent memory exhaustion
+            # from a malformed/hostile upstream.
             async for line in resp.aiter_lines():
+                if len(line) > SSE_BUFFER_CAP:
+                    log_event(
+                        "error",
+                        "upstream.stream.line_too_large",
+                        request_id=request_id,
+                        size=len(line),
+                        cap=SSE_BUFFER_CAP,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Hy3 stream line exceeded size cap ({len(line)} > {SSE_BUFFER_CAP})",
+                    )
                 line = line.strip()
                 if not line.startswith("data: "):
                     continue
@@ -777,7 +888,7 @@ def make_chunk(
     completion_id: str,
     model: str,
     *,
-    content: str = "",
+    content: Optional[str] = None,
     reasoning: str = "",
     role: Optional[str] = None,
     tool_calls: Optional[list] = None,
@@ -787,7 +898,10 @@ def make_chunk(
     delta: dict = {}
     if role:
         delta["role"] = role
-    if content:
+    # Include content in the delta when explicitly provided (even if empty string).
+    # OpenAI emits {"role":"assistant","content":""} on the first chunk; strict
+    # parsers expect the key. None (default) means "don't include the key".
+    if content is not None:
         delta["content"] = content
     if reasoning:
         delta["reasoning_content"] = reasoning
@@ -874,22 +988,24 @@ async def root():
 async def health():
     """Liveness/readiness probe for container orchestrators (Render, Fly, K8s).
 
-    Returns 503 when the limiter reports more active requests than max_concurrent
-    (which should never happen under normal operation — it indicates a counter bug
-    or a slot leak). Also returns 503 when total_errors exceeds 50% of total_acquired
-    with at least 10 acquired, indicating systemic upstream failures.
+    Returns 503 when the upstream error rate over the last 50 requests exceeds
+    50% (with at least 10 in the window). Uses a sliding window so a transient
+    upstream blip doesn't brick the service permanently — once the bad requests
+    age out of the window, /health recovers automatically.
     """
     s = limiter.stats()
-    overflow = s["active_requests"] > s["max_concurrent"]
-    error_rate_high = (
-        s["total_acquired"] >= 10
-        and s["total_errors"] > s["total_acquired"] * 0.5
-    )
-    healthy = not overflow and not error_rate_high
-    status = "ok" if healthy else ("overloaded" if overflow else "degraded")
+    window_n, window_rate = limiter.recent_error_rate()
+    error_rate_high = window_n >= 10 and window_rate > 0.5
+    healthy = not error_rate_high
+    status = "ok" if healthy else "degraded"
     return JSONResponse(
         status_code=200 if healthy else 503,
-        content={"status": status, **s},
+        content={
+            "status": status,
+            "recent_window": window_n,
+            "recent_error_rate": round(window_rate, 3),
+            **s,
+        },
     )
 
 
@@ -926,7 +1042,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # Optional API key check
     if API_KEYS:
         auth = request.headers.get("authorization", "")
-        token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+        # RFC 7235: the auth scheme is case-insensitive. Accept "Bearer", "bearer", etc.
+        token = ""
+        if auth:
+            parts = auth.split(None, 1)  # split on first whitespace
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                token = parts[1].strip()
         # Also allow raw API key in x-api-key header (some clients use this)
         if not token:
             token = request.headers.get("x-api-key", "").strip()
@@ -939,18 +1060,21 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             if _constant_time_match(token, k):
                 authorized = True
         if not authorized:
-            client_ip = request.client.host if request.client else "unknown"
             log_event(
                 "warning",
                 "request.unauthorized",
                 path="/v1/chat/completions",
-                client_ip=client_ip,
+                client_ip=_client_ip(request),
             )
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     # Per-request ID + record for tracing through the entire pipeline
     request_id = new_request_id()
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_ip(request)
+    # Capture created timestamp at request time (OpenAI stamps at request time,
+    # not after generation — a 60s thinking run shouldn't skew the timestamp).
+    created_ts = int(time.time())
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     record = RequestRecord(
         request_id=request_id,
         method="POST",
@@ -1022,18 +1146,27 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         system_prompt=sys_prompt,
         history=history,
         think_level=think_level,
-        max_tokens=req.max_tokens or DEFAULT_MAX_TOKENS,
+        # Use explicit `is None` check — `or` would treat 0 as falsy (but Field(ge=1)
+        # already rejects 0, so this is belt-and-suspenders).
+        max_tokens=req.max_tokens if req.max_tokens is not None else DEFAULT_MAX_TOKENS,
         temperature=req.temperature,
         top_p=req.top_p,
         tools=req.tools,
     )
 
-    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-
     # ----- Concurrency cap: acquire a slot before touching upstream Hy3 -----
     t_queue_start = time.perf_counter()
     record.concurrency_active_at_start = limiter.active
-    acquired = await limiter.acquire()
+    # Wrap acquire() in try/except CancelledError so a client disconnect while
+    # queued finalizes the record (otherwise it's invisible in /admin/requests).
+    try:
+        acquired = await limiter.acquire()
+    except asyncio.CancelledError:
+        record.status_code = 499  # nginx convention: client closed request
+        record.error = "client disconnected while queued"
+        record.queued_ms = round((time.perf_counter() - t_queue_start) * 1000, 1)
+        record.finalize()
+        raise
     record.queued_ms = round((time.perf_counter() - t_queue_start) * 1000, 1)
 
     if not acquired:
@@ -1090,6 +1223,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 limiter=limiter,
                 request_id=request_id,
                 record=record,
+                created_ts=created_ts,
             ),
             media_type="text/event-stream",
             headers={
@@ -1124,6 +1258,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     except HTTPException as e:
         record.status_code = e.status_code
         record.error = str(e.detail)[:300]
+        record.finalize()  # C3: finalize so errors appear in /admin/requests
         log_event(
             "error",
             "request.upstream_http_error",
@@ -1135,6 +1270,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     except Exception as e:
         record.status_code = 502
         record.error = str(e)[:300]
+        record.finalize()  # C3: finalize so errors appear in /admin/requests
         log_event(
             "error",
             "request.unhandled_error",
@@ -1165,37 +1301,46 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         finish_reason=record.finish_reason,
     )
 
-    message: dict = {"role": "assistant", "content": final_resp}
+    # OpenAI spec: content should be null (not "") when tool_calls is present.
+    message: dict = {"role": "assistant", "content": final_resp or None}
     if final_think:
         message["reasoning_content"] = final_think
     if final_tools:
         message["tool_calls"] = make_tool_call_objects(final_tools)
 
     # Estimate token usage (4 chars ≈ 1 token heuristic). Real counts require a
-    # tokenizer; this is good enough for budget tracking.
+    # tokenizer; this is good enough for budget tracking. Include the serialized
+    # tools payload in the prompt count — tool schemas can be thousands of tokens
+    # in agentic workloads, and omitting them systematically underestimates cost.
     prompt_chars = sum(len(_content_to_str(m.content)) for m in req.messages)
+    if req.tools:
+        prompt_chars += len(json.dumps(req.tools, ensure_ascii=False))
     completion_chars = len(final_resp) + len(final_think)
     prompt_tokens = prompt_chars // 4
     completion_tokens = completion_chars // 4
 
-    return {
-        "id": completion_id,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": req.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason,
-            }
-        ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
+    # M5: return JSONResponse so we can attach X-Request-Id (was missing on 200).
+    return JSONResponse(
+        content={
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_ts,
+            "model": req.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
         },
-    }
+        headers={"X-Request-Id": request_id},
+    )
 
 
 async def stream_openai(
@@ -1205,12 +1350,16 @@ async def stream_openai(
     limiter: ConcurrencyLimiter,
     request_id: Optional[str] = None,
     record: Optional[RequestRecord] = None,
+    created_ts: Optional[int] = None,
 ):
     """Yield OpenAI-format SSE chunks. Releases the limiter slot in finally.
 
     `limiter` is required — the caller must have already acquired a slot, and
     this function releases it in the finally block. Passing None would leak
     the slot, so the parameter is mandatory.
+
+    `created_ts` is the request timestamp (captured at request start, not after
+    generation) — matches OpenAI's behavior.
 
     Note: we use a manual try/finally rather than the _slot context manager
     because this is an async generator — the yield points make context manager
@@ -1221,8 +1370,10 @@ async def stream_openai(
     last_think_len = 0
     final_tools: Optional[list] = None
     errored = False
-    # capture created timestamp once and reuse across all chunks (OpenAI behavior)
-    created_ts = int(time.time())
+    if created_ts is None:
+        created_ts = int(time.time())
+    # Track the previous cumulative snapshot to detect divergence (H6).
+    prev_resp = ""
 
     log_event(
         "info",
@@ -1232,12 +1383,29 @@ async def stream_openai(
         model=model,
     )
 
-    # Initial role chunk
-    yield f"data: {json.dumps(make_chunk(completion_id, model, role='assistant', created=created_ts))}\n\n"
+    # Initial role chunk. Include content="" so strict parsers see the key
+    # (OpenAI emits {"role":"assistant","content":""}).
+    yield f"data: {json.dumps(make_chunk(completion_id, model, role='assistant', content='', created=created_ts))}\n\n"
 
     try:
         async for data in call_hy3_stream(payload, request_id=request_id, record=record):
             resp, think, tools, _ = parse_hy3_data(data)
+
+            # H6: detect non-monotonic snapshots. Hy3 should send cumulative
+            # snapshots (each chunk is a superset of the previous). If it ever
+            # sends a diverged or shorter snapshot (retry, regeneration), we
+            # re-sync by re-emitting from the start.
+            if resp and prev_resp and not resp.startswith(prev_resp):
+                log_event(
+                    "warning",
+                    "stream.snapshot_diverged",
+                    request_id=request_id,
+                    prev_len=len(prev_resp),
+                    new_len=len(resp),
+                )
+                last_resp_len = 0  # re-emit from start
+            if resp:
+                prev_resp = resp
 
             # Emit thinking deltas (as reasoning_content, OpenAI o1-style)
             if think and len(think) > last_think_len:
@@ -1323,7 +1491,12 @@ def _require_admin(request: Request):
     if not ADMIN_TOKEN:
         raise HTTPException(status_code=404, detail="Not Found")
     auth = request.headers.get("authorization", "")
-    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    # Case-insensitive Bearer scheme (RFC 7235).
+    token = ""
+    if auth:
+        parts = auth.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1].strip()
     if not token:
         token = request.headers.get("x-admin-token", "").strip()
     # Use constant-time comparison to prevent timing attacks on admin token.

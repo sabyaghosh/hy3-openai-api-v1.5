@@ -25,8 +25,10 @@ USER app
 EXPOSE 8000
 
 # Render injects PORT env var. Default to 8000 for local runs.
+# PYTHONUNBUFFERED=1 ensures logs appear immediately (not block-buffered).
 ENV PORT=8000 \
-    HOST=0.0.0.0
+    HOST=0.0.0.0 \
+    PYTHONUNBUFFERED=1
 
 # Add HEALTHCHECK so standalone Docker runs report health status.
 # render.yaml uses healthCheckPath separately; this is for `docker run` users.
@@ -34,4 +36,8 @@ ENV PORT=8000 \
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD sh -c 'python -c "import os,urllib.request,sys; r=urllib.request.urlopen(\"http://localhost:\"+os.environ.get(\"PORT\",\"8000\")+\"/health\",timeout=3); sys.exit(0 if r.status==200 else 1)" || exit 1'
 
-CMD ["sh", "-c", "uvicorn server:app --host ${HOST} --port ${PORT}"]
+# --proxy-headers: trust X-Forwarded-For/X-Real-IP from the load balancer so
+# request.client.host reflects the real client IP (not the proxy's).
+# --forwarded-allow-ips='*': accept forwarded headers from any upstream proxy
+# (safe behind Render/Fly/Cloud Run/Koyeb's managed load balancers).
+CMD ["sh", "-c", "uvicorn server:app --host ${HOST} --port ${PORT} --proxy-headers --forwarded-allow-ips='*'"]

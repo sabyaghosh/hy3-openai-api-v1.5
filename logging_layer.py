@@ -29,12 +29,16 @@ logger = logging.getLogger("hy3")
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 if not logger.handlers:
     h = logging.StreamHandler(sys.stdout)
+    # Use UTC (converter=time.gmtime) for the stdout formatter so it matches
+    # ts_iso and started_at_iso in the ring buffer. Correlating stdout against
+    # /admin/logs on a non-UTC host would otherwise silently mislead.
     h.setFormatter(
         logging.Formatter(
-            fmt="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
+            fmt="%(asctime)s.%(msecs)03dZ [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
         )
     )
+    h.formatter.converter = time.gmtime  # UTC instead of local time
     logger.addHandler(h)
 
 
@@ -45,9 +49,15 @@ LOG_BUFFER: deque = deque(maxlen=BUFFER_SIZE)
 REQUEST_BUFFER: deque = deque(maxlen=200)  # last 200 request summaries
 
 
-def _truncate(s: Any, n: int = 500) -> str:
+def _truncate(s: Any, n: int = 500) -> Any:
+    """Truncate a value for the ring buffer. Preserves scalar types (int,
+    float, bool) so dashboards can do numeric comparison without re-parsing.
+    Strings and complex types are truncated to n chars with a suffix indicator.
+    """
     if s is None:
         return ""
+    if isinstance(s, (int, float, bool)):
+        return s  # preserve scalar type — don't stringify
     if not isinstance(s, str):
         try:
             s = json.dumps(s, ensure_ascii=False, default=str)
@@ -73,8 +83,8 @@ def log_event(
     ts = time.time()
     entry = {
         "ts": ts,
-        "ts_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts))
-        + f".{int((ts % 1) * 1000):03d}",
+        "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
+        + f".{int((ts % 1) * 1000):03d}Z",
         "level": level.lower(),
         "event": event,
         "request_id": request_id,
@@ -146,8 +156,8 @@ class RequestRecord:
             "client_ip": self.client_ip,
             "started_at": self.started_at,
             "started_at_iso": time.strftime(
-                "%Y-%m-%d %H:%M:%S", time.gmtime(self.started_at)
-            ),
+                "%Y-%m-%dT%H:%M:%S", time.gmtime(self.started_at)
+            ) + "Z",
             "finished_at": self.finished_at,
             "duration_ms": (
                 round((self.finished_at - self.started_at) * 1000, 1)
@@ -216,7 +226,8 @@ def get_recent_requests(limit: int = 50, errors_only: bool = False) -> list[dict
     entries = list(REQUEST_BUFFER)
     entries.reverse()
     if errors_only:
-        entries = [r for r in entries if r["status_code"] is None or r["status_code"] >= 400]
+        # status_code is always set before finalize(), so just check >= 400.
+        entries = [r for r in entries if r["status_code"] is not None and r["status_code"] >= 400]
     return entries[:limit]
 
 

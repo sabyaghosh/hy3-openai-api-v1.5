@@ -29,6 +29,7 @@ env/
 # Secrets — NEVER commit these
 .env
 .env.*
+!.env.example
 *.key
 *.pem
 secrets/

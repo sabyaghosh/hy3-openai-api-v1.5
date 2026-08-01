@@ -76,6 +76,19 @@ while getopts "s:t:m:T:p:c:f:rh" opt; do
 done
 shift $((OPTIND - 1))
 
+# Validate -t (think level) and -m (max tokens) early so users get a clear
+# error instead of a Python traceback from build_payload.
+if [[ -n "$THINK_LEVEL" ]]; then
+  case "$THINK_LEVEL" in
+    high|low|no_think) ;;
+    *) echo "Error: -t must be one of: high, low, no_think (got: $THINK_LEVEL)" >&2; exit 1 ;;
+  esac
+fi
+if ! [[ "$MAX_TOKENS" =~ ^[0-9]+$ ]] || [[ "$MAX_TOKENS" -lt 1 ]]; then
+  echo "Error: -m must be a positive integer (got: $MAX_TOKENS)" >&2
+  exit 1
+fi
+
 # Get prompt from arg or stdin
 if [[ $# -gt 0 ]]; then
   PROMPT="$*"
@@ -91,8 +104,10 @@ if [[ -z "$PROMPT" ]]; then
   exit 1
 fi
 
-# Load conversation history if -c specified
-HISTORY="null"
+# Load conversation history if -c specified.
+# Default is "[]" (empty list) to match the server's wire format — the server
+# always sends a list in this slot, so the CLI should too.
+HISTORY="[]"
 if [[ -n "$CONV_ID" ]]; then
   # Sanitize CONV_ID to prevent path traversal (e.g. "../../etc/passwd")
   if [[ ! "$CONV_ID" =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -145,12 +160,13 @@ print(json.dumps({'data': [msg, sp, hist, tl, temp, mt, tp, pt, json.dumps(tools
 
 PAYLOAD="$(build_payload)"
 
-# Step 1: POST to get event_id
-# Capture curl exit code separately so we can report it accurately.
+# Step 1: POST to get event_id.
+# Use `|| rc=$?` idiom because `set -e` terminates on assignment failure
+# before `rc=$?` can execute. The `||` form is set -e-safe.
+curl_rc=0
 RESPONSE=$(curl -sf --max-time 30 -X POST "$BASE" \
   -H "Content-Type: application/json" \
-  -d "$PAYLOAD" 2>/dev/null)
-curl_rc=$?
+  -d "$PAYLOAD" 2>/dev/null) || curl_rc=$?
 if [[ $curl_rc -ne 0 ]]; then
   echo "Error: Hy3 POST failed (curl exit $curl_rc)" >&2
   echo "  (28=timeout, 22=HTTP error, 6=DNS, 7=connection refused)" >&2
@@ -158,18 +174,21 @@ if [[ $curl_rc -ne 0 ]]; then
 fi
 
 # Extract event_id, with error handling for unexpected JSON.
+# Note: capture stdout only; let stderr go to the console for diagnostics.
 EVENT_ID=$(echo "$RESPONSE" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
     print(d.get('event_id', ''))
 except Exception as e:
-    print(f'Error: failed to parse event_id from response: {e}', file=sys.stderr)
+    sys.stderr.write(f'Error: failed to parse event_id from response: {e}\n')
     sys.exit(1)
-" 2>&1) || {
-  echo "$EVENT_ID" >&2
+")
+if [[ $? -ne 0 ]]; then
+  echo "Error: failed to parse event_id from Hy3 response" >&2
+  echo "  Response: ${RESPONSE:0:200}" >&2
   exit 1
-}
+fi
 
 if [[ -z "$EVENT_ID" ]]; then
   echo "Error: Hy3 returned no event_id" >&2
@@ -179,16 +198,16 @@ fi
 
 # Step 2: Stream and save everything to a temp file, then replay
 # --max-time prevents hanging forever on a stalled stream.
+# Register the cleanup trap after the FIRST mktemp so a failure in the second
+# doesn't leak the first file. The trap references both vars (set to the paths
+# once created; empty strings are safely ignored by rm -f).
 TMPFILE=$(mktemp)
-ERRFILE=$(mktemp)
-# Trap on EXIT, INT, TERM so temp files are cleaned even on signal.
 trap 'rm -f "$TMPFILE" "$ERRFILE"' EXIT INT TERM
+ERRFILE=$(mktemp)
 
-# Capture curl exit code BEFORE the if-block — inside `if !`, $? reflects the
-# if evaluation, not curl. We need the real curl code to distinguish timeout
-# (28) from HTTP error (22) from DNS failure (6).
-curl -sf --max-time 300 -N "${BASE}/${EVENT_ID}" > "$TMPFILE" 2>"$ERRFILE"
-curl_rc=$?
+# Capture curl exit code using `|| rc=$?` idiom (set -e-safe).
+curl_rc=0
+curl -sf --max-time 300 -N "${BASE}/${EVENT_ID}" > "$TMPFILE" 2>"$ERRFILE" || curl_rc=$?
 if [[ $curl_rc -ne 0 ]]; then
   echo "Error: failed to fetch Hy3 stream (curl exit $curl_rc)" >&2
   echo "  (28=timeout, 22=HTTP error, 6=DNS, 7=connection refused)" >&2
@@ -286,9 +305,9 @@ if final_data and len(final_data[0]) > 2 and final_data[0][2]:
             print(f'\nTOOL_CALL:{envelope}', file=sys.stderr)
 
 if mode == 'raw' and final_data:
+    # Raw mode outputs ONLY the response text — do not fall back to thinking
+    # text, which would silently corrupt scripts piping this output.
     text = final_data[0][0] or ''
-    if not text and len(final_data[0]) > 1 and final_data[0][1]:
-        text = final_data[0][1]
     print(text)
 elif mode == 'stream':
     if last_resp == 0 and last_think > 0:
