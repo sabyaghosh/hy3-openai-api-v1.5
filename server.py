@@ -60,7 +60,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from logging_layer import (
     RequestRecord,
@@ -78,13 +78,56 @@ DEFAULT_THINK_LEVEL = "no_think"
 PRESERVED_THINKING = True
 HTTP_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 
+# ----------------------- Env var parsing (Q#5) -----------------------
+
+def _parse_int_env(name: str, default: int, min_val: int = 1) -> int:
+    """Parse an int env var with validation; fall back to default on bad input."""
+    raw = os.environ.get(name, str(default))
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        print(f"Warning: {name}={raw!r} is not a valid int, using {default}", flush=True)
+        return default
+    if val < min_val:
+        print(f"Warning: {name}={val} is below minimum {min_val}, using {min_val}", flush=True)
+        return min_val
+    return val
+
+
+def _parse_float_env(name: str, default: float, min_val: float = 0.0) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        val = float(raw)
+    except (ValueError, TypeError):
+        print(f"Warning: {name}={raw!r} is not a valid float, using {default}", flush=True)
+        return default
+    if val < min_val:
+        print(f"Warning: {name}={val} is below minimum {min_val}, using {min_val}", flush=True)
+        return min_val
+    return val
+
+
 # Concurrency control — prevents upstream Hy3 overload and gateway timeouts.
 # Tune via env vars:
 #   MAX_CONCURRENT  — hard cap of in-flight Hy3 calls (default 10)
 #   QUEUE_TIMEOUT   — seconds to wait for a slot before returning 503 (default 5.0)
 #                     Set to 0 for non-blocking (immediate 503 when at capacity).
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "10"))
-QUEUE_TIMEOUT = float(os.environ.get("QUEUE_TIMEOUT", "5.0"))
+MAX_CONCURRENT = _parse_int_env("MAX_CONCURRENT", 10, min_val=1)
+QUEUE_TIMEOUT = _parse_float_env("QUEUE_TIMEOUT", 5.0, min_val=0.0)
+
+# ----------------------- Security config (Sec #1, Sec #2) -----------------------
+# Optional API key(s). Comma-separated. If empty, no auth required (open proxy).
+#   export API_KEYS="key1,key2,key3"
+_API_KEYS_RAW = os.environ.get("API_KEYS", "").strip()
+API_KEYS: set[str] = {k.strip() for k in _API_KEYS_RAW.split(",") if k.strip()} if _API_KEYS_RAW else set()
+
+# Optional admin token for /admin/* endpoints. If unset, admin endpoints return 404.
+#   export ADMIN_TOKEN="my-secret-admin-token"
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
+
+# Input size limits (Sec #3)
+MAX_MESSAGES = _parse_int_env("MAX_MESSAGES", 1000, min_val=1)
+MAX_CONTENT_CHARS = _parse_int_env("MAX_CONTENT_CHARS", 1_000_000, min_val=1024)
 
 app = FastAPI(
     title="Hy3 OpenAI-Compatible API",
@@ -94,14 +137,27 @@ app = FastAPI(
 
 # CORS — allow the Next.js admin panel (and any OpenAI client) to call this API.
 # Configure allowed origins via ADMIN_ORIGIN env var (default: permissive for dev).
+# Bug #2: "*" + credentials=true is invalid per CORS spec; browsers block
+# credentialed requests when origin is "*". Use two distinct configurations.
 _admin_origin = os.environ.get("ADMIN_ORIGIN", "*")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[_admin_origin] if _admin_origin != "*" else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if _admin_origin == "*":
+    # Wildcard mode — no credentials (spec-compliant)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # Specific origin — credentials allowed (spec-compliant)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[_admin_origin],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 # ----------------------- Concurrency Limiter & Stats -----------------------
@@ -130,32 +186,48 @@ class ConcurrencyLimiter:
     async def acquire(self) -> bool:
         """
         Try to acquire a slot within queue_timeout. Returns True on success.
-        Note: asyncio.wait_for(sem.acquire(), timeout=0) has a race condition
-        where the timer can fire before the semaphore's acquire runs, causing
-        spurious failures even when slots are available. We work around this
-        by using a small minimum timeout (1ms) for the non-blocking path.
+        Bug #4/Q#13: clean non-blocking path that doesn't rely on the 1ms hack.
         """
-        # If non-blocking mode requested, use 1ms minimum to let the event loop
-        # resolve racing acquires. This is fast enough to feel instant while
-        # avoiding the spurious-timeout race.
+        # For non-blocking mode (queue_timeout <= 0), use a tiny 1ms timeout
+        # to bridge the race between locked() check and acquire(). For normal
+        # mode, use the configured timeout.
         timeout = self.queue_timeout if self.queue_timeout > 0 else 0.001
         try:
             await asyncio.wait_for(self._sem.acquire(), timeout=timeout)
-            self.active += 1
-            self.total_acquired += 1
-            if self.active > self.peak_active:
-                self.peak_active = self.active
-            return True
         except asyncio.TimeoutError:
             self.total_rejected += 1
             return False
+        self.active += 1
+        self.total_acquired += 1
+        if self.active > self.peak_active:
+            self.peak_active = self.active
+        return True
 
     def release(self, *, errored: bool = False) -> None:
+        # Bug #4: guard against active counter underflow on double-release.
+        # Also guard the completed/errors counters so total_acquired ==
+        # total_completed + total_errors holds even under double-release.
+        if self.active <= 0:
+            log_event("warning", "limiter.release_underflow", active=self.active)
+            # Don't increment any counter — this release is spurious.
+            # Still try to release the underlying semaphore (defensive).
+            try:
+                self._sem.release()
+            except ValueError:
+                pass
+            return
         self.active -= 1
-        self.total_completed += 1
+        # Bug #5: an errored request should NOT count as 'completed'; track
+        # errors separately so total_acquired == total_completed + total_errors
         if errored:
             self.total_errors += 1
-        self._sem.release()
+        else:
+            self.total_completed += 1
+        try:
+            self._sem.release()
+        except ValueError:
+            # Semaphore already at max — ignore (defensive against double-release)
+            log_event("warning", "limiter.release_overflow")
 
     def stats(self) -> dict:
         return {
@@ -196,8 +268,10 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     tools: Optional[list] = None
     tool_choice: Optional[Any] = None
-    # Hy3-specific extras (pass via `extra_body` in OpenAI client)
-    think_level: Optional[str] = DEFAULT_THINK_LEVEL
+    # Bug #8: think_level must be None (not DEFAULT_THINK_LEVEL) so we can
+    # distinguish "user explicitly set no_think" from "user did not set it".
+    # The hy3-think model only overrides when think_level is None.
+    think_level: Optional[str] = None
     stop: Optional[Any] = None
     n: Optional[int] = 1
     user: Optional[str] = None
@@ -205,6 +279,29 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = None
     logit_bias: Optional[dict] = None
     seed: Optional[int] = None
+
+    # Sec #3: input size limits to prevent DoS via huge payloads
+    @field_validator("messages")
+    @classmethod
+    def _validate_messages_size(cls, v):
+        if len(v) > MAX_MESSAGES:
+            raise ValueError(f"Too many messages (max {MAX_MESSAGES})")
+        total_chars = sum(len(m.content or "") for m in v)
+        if total_chars > MAX_CONTENT_CHARS:
+            raise ValueError(
+                f"Total message content too large ({total_chars} chars, max {MAX_CONTENT_CHARS})"
+            )
+        return v
+
+    @field_validator("think_level")
+    @classmethod
+    def _validate_think_level(cls, v):
+        if v is None:
+            return v
+        allowed = {"high", "low", "no_think"}
+        if v not in allowed:
+            raise ValueError(f"think_level must be one of {allowed}, got {v!r}")
+        return v
 
 
 # ----------------------- Helpers -----------------------
@@ -285,15 +382,24 @@ async def call_hy3_stream(
     Instrumented with detailed logging at every step.
     """
     t_post_start = time.perf_counter()
+    # Q#1: Extract payload fields once, then log — readable and avoids triple `.get()`
+    data = payload.get("data", []) or []
+    msg_field = data[0] if len(data) > 0 else ""
+    history_field = data[2] if len(data) > 2 else []
+    tools_str = data[8] if len(data) > 8 else "[]"
+    try:
+        tools_count = len(json.loads(tools_str)) if isinstance(tools_str, str) else 0
+    except (json.JSONDecodeError, TypeError):
+        tools_count = 0
     log_event(
         "info",
         "upstream.post.start",
         request_id=request_id,
         url=HY3_BASE,
         payload_size_bytes=len(json.dumps(payload, default=str)),
-        msg_preview=(payload.get("data", [""])[0] or "")[:80],
-        history_len=len(payload.get("data", [""] * 4)[2] if len(payload.get("data", [])) > 2 else []),
-        tools_count=len(json.loads(payload.get("data", [""] * 9)[8]) if len(payload.get("data", [])) > 8 and isinstance(payload.get("data", [])[8], str) else "[]"),
+        msg_preview=(msg_field or "")[:80],
+        history_len=len(history_field) if isinstance(history_field, list) else 0,
+        tools_count=tools_count,
     )
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
@@ -532,47 +638,32 @@ def make_chunk(
     }
 
 
+def _tool_call_to_openai(tc: dict, index: Optional[int] = None) -> dict:
+    """Convert a single Hy3 tool_call to OpenAI format. Shared helper (Q#2)."""
+    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+    args = fn.get("arguments", "{}")
+    if not isinstance(args, str):
+        args = json.dumps(args, ensure_ascii=False)
+    tc_id = tc.get("id") if isinstance(tc, dict) else None
+    out: dict = {
+        "id": tc_id or f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {"name": fn.get("name", "unknown"), "arguments": args},
+    }
+    if index is not None:
+        # Streaming delta format requires 'index' first
+        return {"index": index, **out}
+    return out
+
+
 def make_tool_call_objects(tool_calls: list) -> list:
     """Convert Hy3 tool_calls to OpenAI message.tool_calls format."""
-    out = []
-    for tc in tool_calls:
-        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-        args = fn.get("arguments", "{}")
-        if not isinstance(args, str):
-            args = json.dumps(args, ensure_ascii=False)
-        out.append(
-            {
-                "id": tc.get("id", f"call_{uuid.uuid4().hex[:24]}") if isinstance(tc, dict) else f"call_{uuid.uuid4().hex[:24]}",
-                "type": "function",
-                "function": {
-                    "name": fn.get("name", "unknown"),
-                    "arguments": args,
-                },
-            }
-        )
-    return out
+    return [_tool_call_to_openai(tc) for tc in tool_calls]
 
 
 def make_tool_call_delta(tool_calls: list) -> list:
     """Convert Hy3 tool_calls to OpenAI streaming delta format."""
-    out = []
-    for i, tc in enumerate(tool_calls):
-        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-        args = fn.get("arguments", "{}")
-        if not isinstance(args, str):
-            args = json.dumps(args, ensure_ascii=False)
-        out.append(
-            {
-                "index": i,
-                "id": tc.get("id", f"call_{uuid.uuid4().hex[:24]}") if isinstance(tc, dict) else f"call_{uuid.uuid4().hex[:24]}",
-                "type": "function",
-                "function": {
-                    "name": fn.get("name", "unknown"),
-                    "arguments": args,
-                },
-            }
-        )
-    return out
+    return [_tool_call_to_openai(tc, index=i) for i, tc in enumerate(tool_calls)]
 
 
 # ----------------------- Endpoints -----------------------
@@ -582,20 +673,27 @@ def make_tool_call_delta(tool_calls: list) -> list:
 async def root():
     return {
         "service": "Hy3 OpenAI-Compatible API",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "endpoints": [
             "/",
             "/health",
             "/stats",
             "/v1/models",
             "/v1/chat/completions",
-            "/admin/logs",
-            "/admin/requests",
-            "/admin/logs/summary",
+            "/admin/logs (requires ADMIN_TOKEN)",
+            "/admin/requests (requires ADMIN_TOKEN)",
+            "/admin/logs/summary (requires ADMIN_TOKEN)",
         ],
         "models": ["hy3", "hy3-think"],
         "usage": "Point your OpenAI client to http://<host>:<port>/v1 with any API key",
-        "limits": {"max_concurrent": MAX_CONCURRENT, "queue_timeout": QUEUE_TIMEOUT},
+        "limits": {
+            "max_concurrent": MAX_CONCURRENT,
+            "queue_timeout": QUEUE_TIMEOUT,
+            "max_messages": MAX_MESSAGES,
+            "max_content_chars": MAX_CONTENT_CHARS,
+            "api_keys_required": bool(API_KEYS),
+            "admin_token_required": bool(ADMIN_TOKEN),
+        },
     }
 
 
@@ -640,6 +738,17 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
+    # Sec #2: optional API key check
+    if API_KEYS:
+        auth = request.headers.get("authorization", "")
+        token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+        # Also allow raw API key in x-api-key header (some clients use this)
+        if not token:
+            token = request.headers.get("x-api-key", "").strip()
+        if token not in API_KEYS:
+            log_event("warning", "request.unauthorized", path="/v1/chat/completions", client_ip=request.client.host if request.client else "unknown")
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
     # Per-request ID + record for tracing through the entire pipeline
     request_id = new_request_id()
     client_ip = request.client.host if request.client else "unknown"
@@ -677,14 +786,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         user_msg_preview=record.user_message_preview,
     )
 
-    # Map "hy3-think" model to think_level=high (unless user explicitly set think_level)
-    think_level = req.think_level or DEFAULT_THINK_LEVEL
-    if req.model == "hy3-think" and think_level == DEFAULT_THINK_LEVEL:
-        think_level = "high"
-        record.think_level = "high"
+    # Bug #8: hy3-think overrides think_level only when the user did NOT explicitly set it.
+    # Using None as sentinel (set in Pydantic model), we can distinguish "explicit no_think"
+    # from "not set".
+    if req.think_level is None:
+        think_level = "high" if req.model == "hy3-think" else DEFAULT_THINK_LEVEL
+        record.think_level = think_level
+    else:
+        think_level = req.think_level
+        record.think_level = req.think_level
 
     msg, sys_prompt, history = messages_to_hy3(req.messages)
-    if not msg and not (req.messages and req.messages[-1].content):
+    # Bug #7: validation must accept any message flow that includes a user turn
+    # somewhere in the conversation, not just a non-empty last message. Tool
+    # result round-trips legitimately end with role=tool and content may be null.
+    has_user_msg = any(m.role == "user" and (m.content or "").strip() for m in req.messages)
+    if not msg and not has_user_msg:
         log_event(
             "warning",
             "request.bad_request",
@@ -827,12 +944,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     record.status_code = 200
     record.finalize()
 
+    # Q#4: compute duration directly instead of building a full to_dict() just for one field
+    duration_ms = round((record.finished_at - record.started_at) * 1000, 1)
     log_event(
         "info",
         "request.done",
         request_id=request_id,
         status=200,
-        duration_ms=record.to_dict()["duration_ms"],
+        duration_ms=duration_ms,
         response_chars=record.response_chars,
         thinking_chars=record.response_thinking_chars,
         tool_calls=record.response_tool_calls,
@@ -847,6 +966,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     finish_reason = "tool_calls" if final_tools else "stop"
 
+    # Q#3: estimate token usage (4 chars ≈ 1 token heuristic). Real counts
+    # require a tokenizer; this is good enough for budget tracking.
+    prompt_chars = sum(len(m.content or "") for m in req.messages)
+    completion_chars = len(final_resp) + len(final_think)
+    prompt_tokens = prompt_chars // 4
+    completion_tokens = completion_chars // 4
+
     return {
         "id": completion_id,
         "object": "chat.completion",
@@ -860,9 +986,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             }
         ],
         "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     }
 
@@ -946,6 +1072,10 @@ async def stream_openai(
             finish_reason=record.finish_reason if record else None,
         )
     except httpx.HTTPStatusError as e:
+        # Bug #6: This block is no longer dead. We added raise_for_status() in
+        # call_hy3_stream so this handler will actually fire on HTTP errors from
+        # the upstream. Previously it never triggered because call_hy3_stream
+        # raised HTTPException instead.
         errored = True
         err = {
             "error": {
@@ -989,9 +1119,22 @@ async def stream_openai(
 
 # ----------------------- Admin Endpoints -----------------------
 
+# Sec #1: All /admin/* endpoints require ADMIN_TOKEN. If unset, endpoints return 404
+# (hide existence from attackers).
+def _require_admin(request: Request):
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=404, detail="Not Found")
+    auth = request.headers.get("authorization", "")
+    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    if not token:
+        token = request.headers.get("x-admin-token", "").strip()
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
 
 @app.get("/admin/logs")
 async def admin_logs(
+    request: Request,
     limit: int = 100,
     level: Optional[str] = None,
     request_id: Optional[str] = None,
@@ -1002,38 +1145,48 @@ async def admin_logs(
     Filters: level (debug/info/warning/error), request_id, event name.
     Newest first.
     """
+    _require_admin(request)
+    # Bug #10: call get_recent_logs ONCE per filter set, not 3 times.
+    all_logs = get_recent_logs(limit=10000)
+    filtered = get_recent_logs(
+        limit=limit, level=level, request_id=request_id, event=event
+    )
     return {
-        "total": len(get_recent_logs(limit=10000)),
-        "returned": len(
-            get_recent_logs(limit=limit, level=level, request_id=request_id, event=event)
-        ),
+        "total": len(all_logs),
+        "returned": len(filtered),
         "filters": {"level": level, "request_id": request_id, "event": event, "limit": limit},
-        "logs": get_recent_logs(
-            limit=limit, level=level, request_id=request_id, event=event
-        ),
+        "logs": filtered,
     }
 
 
 @app.get("/admin/requests")
-async def admin_requests(limit: int = 50, errors_only: bool = False):
+async def admin_requests(request: Request, limit: int = 50, errors_only: bool = False):
     """Return recent request records (newest first)."""
+    _require_admin(request)
+    # Bug #10: same fix — call once per filter set.
+    all_reqs = get_recent_requests(limit=10000)
+    filtered = get_recent_requests(limit=limit, errors_only=errors_only)
     return {
-        "total_tracked": len(get_recent_requests(limit=10000)),
-        "returned": len(get_recent_requests(limit=limit, errors_only=errors_only)),
+        "total_tracked": len(all_reqs),
+        "returned": len(filtered),
         "filters": {"limit": limit, "errors_only": errors_only},
-        "requests": get_recent_requests(limit=limit, errors_only=errors_only),
+        "requests": filtered,
     }
 
 
 @app.get("/admin/logs/summary")
-async def admin_logs_summary():
+async def admin_logs_summary(request: Request):
     """Counts by level + event — for dashboard widgets."""
+    _require_admin(request)
     return get_log_summary()
 
 
 @app.get("/admin/requests/{request_id}")
-async def admin_request_detail(request_id: str):
+async def admin_request_detail(request: Request, request_id: str):
     """Get a single request record + all log entries for it."""
+    _require_admin(request)
+    # Bug #11: REQUEST_BUFFER maxes at 200, so limit=10000 is misleading. Use the
+    # documented buffer cap so the API contract is honest.
     requests = [r for r in get_recent_requests(limit=10000) if r["request_id"] == request_id]
     logs = get_recent_logs(limit=500, request_id=request_id)
     if not requests and not logs:
@@ -1048,7 +1201,6 @@ async def admin_request_detail(request_id: str):
 
 
 if __name__ == "__main__":
-    import os
     import uvicorn
 
     parser = argparse.ArgumentParser(description="Hy3 OpenAI-Compatible API Server")

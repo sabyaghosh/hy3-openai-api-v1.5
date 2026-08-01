@@ -11,21 +11,22 @@ The ring buffer is bounded (default 1000 entries) and process-local.
 For production multi-instance deployments, replace with Redis/Postgres.
 """
 
-import asyncio
+import asyncio  # noqa: F401  (retained for backward compat with downstream imports)
 import json
 import logging
+import os
 import sys
 import time
-import traceback
 import uuid
 from collections import deque
-from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 # ----------------------- Logger setup -----------------------
 
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
 logger = logging.getLogger("hy3")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 if not logger.handlers:
     h = logging.StreamHandler(sys.stdout)
     h.setFormatter(
@@ -112,6 +113,7 @@ class RequestRecord:
         self.finished_at: Optional[float] = None
         self.status_code: Optional[int] = None
         self.error: Optional[str] = None
+        self._finalized = False  # Bug #12: guard against double-finalize
         # Request details
         self.model: Optional[str] = None
         self.stream: bool = False
@@ -174,6 +176,10 @@ class RequestRecord:
         }
 
     def finalize(self) -> None:
+        # Bug #12: idempotent — safe to call multiple times
+        if self._finalized:
+            return
+        self._finalized = True
         self.finished_at = time.time()
         REQUEST_BUFFER.append(self.to_dict())
 

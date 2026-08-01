@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11.9-slim-bookworm
 
 # Metadata
 LABEL org.opencontainers.image.title="hy3-openai-api" \
@@ -15,8 +15,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
-COPY --chown=app:app server.py hy3.sh tools_example.json README.md ./
+# Copy app code (NOTE: logging_layer.py is imported by server.py — must be included)
+COPY --chown=app:app server.py logging_layer.py hy3.sh tools_example.json README.md ./
 RUN chmod +x hy3.sh
 
 USER app

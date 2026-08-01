@@ -23,6 +23,12 @@ CONV_ID=""
 RAW=0
 TOOLS_JSON=""
 
+# Q#9: verify python3 is available before we depend on it later
+command -v python3 >/dev/null 2>&1 || {
+  echo "Error: python3 is required but not installed" >&2
+  exit 1
+}
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [OPTIONS] "prompt"
@@ -87,6 +93,11 @@ fi
 # Load conversation history if -c specified
 HISTORY="null"
 if [[ -n "$CONV_ID" ]]; then
+  # Q#10: sanitize CONV_ID to prevent path traversal (e.g. "../../etc/passwd")
+  if [[ ! "$CONV_ID" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Error: conversation ID must be alphanumeric (a-z, 0-9, -, _)" >&2
+    exit 1
+  fi
   mkdir -p "$STATE_DIR"
   STATE_FILE="$STATE_DIR/${CONV_ID}.json"
   if [[ -f "$STATE_FILE" ]]; then
@@ -144,7 +155,19 @@ fi
 TMPFILE=$(mktemp)
 trap "rm -f '$TMPFILE'" EXIT
 
-curl -sf -N "${BASE}/${EVENT_ID}" > "$TMPFILE" 2>/dev/null
+# Bug #13: don't swallow curl errors. Capture exit code + check for empty output.
+if ! curl -sf -N "${BASE}/${EVENT_ID}" > "$TMPFILE" 2>&1; then
+  echo "Error: failed to fetch Hy3 stream (curl exit $?)" >&2
+  if [[ -s "$TMPFILE" ]]; then
+    echo "--- Response body ---" >&2
+    head -c 500 "$TMPFILE" >&2
+  fi
+  exit 1
+fi
+if [[ ! -s "$TMPFILE" ]]; then
+  echo "Error: empty response from Hy3" >&2
+  exit 1
+fi
 
 # Output: stream or raw
 export HY3_MODE
@@ -160,7 +183,9 @@ conv_id = os.environ.get('HY3_CONV', '')
 tmpfile = os.environ.get('HY3_TMP', '')
 state_dir = os.environ.get('HY3_STATE', '')
 
-lines = open(tmpfile).read().split('\n')
+# Bug #15: use `with` to avoid file handle leak
+with open(tmpfile, encoding='utf-8') as f:
+    lines = f.read().split('\n')
 
 final_data = None
 last_think = 0
@@ -173,7 +198,7 @@ for line in lines:
         try:
             data = json.loads(payload)
             _ = data[0][0]
-        except:
+        except Exception:  # Bug #16: was bare `except:` which catches KeyboardInterrupt
             continue
 
         resp_text = data[0][0] or ''
@@ -208,7 +233,15 @@ if final_data and len(final_data[0]) > 2 and final_data[0][2]:
             name = fn.get('name', 'unknown')
             args = fn.get('arguments', '{}')
             tc_id = tc.get('id', '')
-            print(f'\nTOOL_CALL:{tc_id}:{name}:{args}', file=sys.stderr)
+            # Bug #14: use JSON envelope so colons in args don't break parsing.
+            # Old format: TOOL_CALL:id:name:args  (ambiguous if args contains ':')
+            # New format: TOOL_CALL:{json}
+            envelope = json.dumps({
+                'id': tc_id,
+                'name': name,
+                'arguments': args if isinstance(args, str) else json.dumps(args),
+            }, ensure_ascii=False)
+            print(f'\nTOOL_CALL:{envelope}', file=sys.stderr)
 
 if mode == 'raw' and final_data:
     text = final_data[0][0] or ''
@@ -224,8 +257,8 @@ if conv_id and final_data and state_dir:
     try:
         os.makedirs(state_dir, exist_ok=True)
         messages = final_data[0][3]
-        with open(os.path.join(state_dir, conv_id + '.json'), 'w') as f:
+        with open(os.path.join(state_dir, conv_id + '.json'), 'w', encoding='utf-8') as f:
             json.dump(messages, f, ensure_ascii=False)
-    except Exception:
-        pass
+    except Exception as e:  # Q#11: was `pass` — silent failure
+        sys.stderr.write(f'Warning: failed to save conversation state: {e}\n')
 PYEOF
