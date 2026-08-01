@@ -76,14 +76,6 @@ HY3_BASE = "https://tencent-Hy3.hf.space/gradio_api/call/chat"
 DEFAULT_MODEL = "hy3"
 DEFAULT_MAX_TOKENS = 262144
 DEFAULT_THINK_LEVEL = "no_think"
-# Whether to preserve thinking content in the Hy3 response. Passed as the 8th
-# field in the Gradio data payload. When True, Hy3 includes reasoning text in
-# the response so we can expose it as reasoning_content (OpenAI o1-style).
-PRESERVED_THINKING = True
-# Read timeout (90s) is below Render's ~100s gateway timeout so the upstream
-# call fails before the gateway returns 504 to the client (which would leave the
-# limiter slot occupied for the remaining ~210s of the old 300s timeout).
-HTTP_TIMEOUT = httpx.Timeout(90.0, connect=30.0)
 
 # Single source of truth for the version string. Used by both the FastAPI app
 # metadata (visible at /docs, /openapi.json) and the / endpoint.
@@ -118,6 +110,23 @@ def _parse_float_env(name: str, default: float, min_val: float = 0.0) -> float:
     return val
 
 
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, str(default)).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+# Whether to preserve thinking content in the Hy3 response. Passed as the 8th
+# field in the Gradio data payload. When True, Hy3 includes reasoning text in
+# the response so we can expose it as reasoning_content (OpenAI o1-style).
+# Env-tunable since it inflates latency and token counts.
+PRESERVED_THINKING = _parse_bool_env("PRESERVED_THINKING", True)
+# Read timeout — configurable because gateway limits differ by platform.
+# Default 90s is below Render's ~100s gateway timeout so the upstream call fails
+# before the gateway returns 504 to the client. On platforms without a gateway
+# timeout (Fly, Cloud Run), set HTTP_READ_TIMEOUT=300 for long thinking generations.
+HTTP_READ_TIMEOUT = _parse_float_env("HTTP_READ_TIMEOUT", 90.0, min_val=1.0)
+HTTP_TIMEOUT = httpx.Timeout(HTTP_READ_TIMEOUT, connect=30.0)
+
 # Concurrency control — prevents upstream Hy3 overload and gateway timeouts.
 # Tune via env vars:
 #   MAX_CONCURRENT  — hard cap of in-flight Hy3 calls (default 10)
@@ -131,6 +140,20 @@ QUEUE_TIMEOUT = _parse_float_env("QUEUE_TIMEOUT", 5.0, min_val=0.0)
 #   export API_KEYS="key1,key2,key3"
 _API_KEYS_RAW = os.environ.get("API_KEYS", "").strip()
 API_KEYS: set[str] = {k.strip() for k in _API_KEYS_RAW.split(",") if k.strip()} if _API_KEYS_RAW else set()
+# Warn if API_KEYS was set but parsed to zero valid keys (e.g. API_KEYS=" , ")
+if _API_KEYS_RAW and not API_KEYS:
+    print(
+        "Warning: API_KEYS was set but parsed to zero valid keys — "
+        "running WITHOUT auth. Check for stray commas or whitespace.",
+        flush=True,
+    )
+
+# Timing-safe string comparison that tolerates non-ASCII characters.
+# hmac.compare_digest(str, str) raises TypeError on non-ASCII; encoding to
+# bytes avoids the crash. An unauthenticated caller sending a non-ASCII token
+# would otherwise trigger a 500 instead of a 401.
+def _constant_time_match(token: str, expected: str) -> bool:
+    return hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
 
 # Optional admin token for /admin/* endpoints. If unset, admin endpoints return 404.
 #   export ADMIN_TOKEN="my-secret-admin-token"
@@ -140,10 +163,32 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 MAX_MESSAGES = _parse_int_env("MAX_MESSAGES", 1000, min_val=1)
 MAX_CONTENT_CHARS = _parse_int_env("MAX_CONTENT_CHARS", 1_000_000, min_val=1024)
 
+# Cap on the SSE line buffer to prevent unbounded memory growth from a
+# malformed upstream (e.g. a response with no newline). 10MB is generous —
+# the largest legitimate payload with max_tokens=262144 is well under 2MB.
+SSE_BUFFER_CAP = _parse_int_env("SSE_BUFFER_CAP", 10_000_000, min_val=1024)
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage shared resources across the application lifecycle.
+
+    A shared httpx.AsyncClient eliminates per-request TCP+TLS handshakes to the
+    upstream Hy3 host (~100-300ms saved per request at the cost of one open
+    connection pool). Created once, closed on shutdown.
+    """
+    app.state.http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+    try:
+        yield
+    finally:
+        await app.state.http_client.aclose()
+
 app = FastAPI(
     title="Hy3 OpenAI-Compatible API",
     version=__version__,
     description="OpenAI-compatible proxy for Tencent Hy3 295B MoE via HuggingFace Gradio API.",
+    lifespan=lifespan,
 )
 
 # CORS — allow the Next.js admin panel (and any OpenAI client) to call this API.
@@ -207,6 +252,11 @@ class ConcurrencyLimiter:
         can distinguish "available now" from "became available in 1ms", but the
         1ms ceiling is negligible in practice. For normal mode, uses the
         configured queue_timeout.
+
+        If the client disconnects while queued, asyncio.wait_for raises
+        CancelledError (not TimeoutError). We re-raise it so the caller's
+        finally block can finalize the record — but we don't count it as a
+        rejection (the client gave up, not the server).
         """
         timeout = self.queue_timeout if self.queue_timeout > 0 else 0.001
         try:
@@ -214,6 +264,11 @@ class ConcurrencyLimiter:
         except asyncio.TimeoutError:
             self.total_rejected += 1
             return False
+        except asyncio.CancelledError:
+            # Client disconnected while waiting in queue. Re-raise so the caller
+            # can clean up. Don't increment total_rejected (client gave up, not
+            # server overload). Don't touch the semaphore (we never acquired it).
+            raise
         self.active += 1
         self.total_acquired += 1
         if self.active > self.peak_active:
@@ -222,8 +277,12 @@ class ConcurrencyLimiter:
 
     def release(self, *, errored: bool = False) -> None:
         # Guard against active counter underflow on double-release. If active is
-        # already 0, this release is spurious — log and return without touching
-        # the semaphore (it's already at max capacity).
+        # already 0, this release is spurious — log it (it indicates a bug in
+        # the caller's release logic) and return without touching the semaphore.
+        # NOTE: a genuine double-release silently leaks a semaphore slot because
+        # we skip _sem.release() here. If you see release_underflow warnings,
+        # investigate the caller — the _slot context manager below prevents this
+        # structurally.
         if self.active <= 0:
             log_event("warning", "limiter.release_underflow", active=self.active)
             return
@@ -249,6 +308,35 @@ class ConcurrencyLimiter:
             "total_errors": self.total_errors,
             "uptime_seconds": round(time.time() - self.started_at, 1),
         }
+
+
+from contextlib import asynccontextmanager as _acm
+
+@_acm
+async def _slot(limiter: "ConcurrencyLimiter"):
+    """Own exactly one limiter slot; release exactly once, no matter how we exit.
+
+    This prevents double-release (which leaks semaphore capacity) and
+    forgotten-release (which leaks the slot forever). Use:
+
+        acquired = await limiter.acquire()
+        if not acquired:
+            return JSONResponse(..., status_code=503)
+        async with _slot(limiter):
+            ...  # do upstream work
+
+    The context manager handles both success and exception paths.
+    """
+    released = False
+    try:
+        yield
+    except BaseException:
+        limiter.release(errored=True)
+        released = True
+        raise
+    finally:
+        if not released:
+            limiter.release(errored=False)
 
 
 limiter = ConcurrencyLimiter(MAX_CONCURRENT, QUEUE_TIMEOUT)
@@ -286,6 +374,8 @@ class ChatCompletionRequest(BaseModel):
     # NOT forwarded to upstream Hy3 (it doesn't support them). They are silently
     # ignored. If Hy3 adds support in the future, wire them up in build_payload().
     stop: Optional[Any] = None
+    # n: Hy3 only supports n=1. We accept n=1 or n=None (not specified) for
+    # compatibility. n>1 returns 422 via the validator below.
     n: Optional[int] = 1
     user: Optional[str] = None
     presence_penalty: Optional[float] = None
@@ -319,8 +409,8 @@ class ChatCompletionRequest(BaseModel):
     @field_validator("n")
     @classmethod
     def _validate_n(cls, v):
-        # Hy3 only supports n=1 (single completion). Reject n>1 explicitly so
-        # clients get a clear error instead of silently receiving 1 choice.
+        # Hy3 only supports n=1 (single completion). Reject n>1 explicitly.
+        # n=None (explicit null) is accepted as "not specified" — same as omitting.
         if v is not None and v != 1:
             raise ValueError(f"n must be 1 (Hy3 does not support multiple completions), got {v}")
         return v
@@ -360,7 +450,6 @@ def messages_to_hy3(messages: list[ChatMessage]) -> tuple[str, str, list]:
     The latest user message becomes the top-level `msg` parameter; all prior
     non-system messages become the `history` list.
     """
-    system_prompt = ""
     history: list = []
     last_user_msg = ""
 
@@ -391,7 +480,7 @@ def messages_to_hy3(messages: list[ChatMessage]) -> tuple[str, str, list]:
             prior = list(non_system)  # shallow copy; we'll extract the prompt from it
             for i in range(len(prior) - 1, -1, -1):
                 if prior[i].role == "user" and _content_to_str(prior[i].content).strip():
-                    last_user_msg = _content_to_str(prior[i])
+                    last_user_msg = _content_to_str(prior[i].content)
                     del prior[i]
                     break
             # If we never found a user message, use the last message as the prompt
@@ -467,192 +556,204 @@ async def call_hy3_stream(
         tools_count=tools_count,
     )
 
-    # A new AsyncClient per request. For high-throughput deployments, a shared
-    # client created in the FastAPI lifespan and stored on app.state would reduce
-    # TCP/TLS overhead — but per-request is simpler and avoids lifespan complexity.
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        # Step 1: get event_id
-        try:
-            r = await client.post(HY3_BASE, json=payload)
-        except httpx.TimeoutException as e:
-            log_event(
-                "error",
-                "upstream.post.timeout",
-                request_id=request_id,
-                error=f"{type(e).__name__}: {e}",
-                elapsed_ms=round((time.perf_counter() - t_post_start) * 1000, 1),
-            )
-            if record:
-                record.error = f"upstream POST timeout: {e}"
-            raise HTTPException(status_code=504, detail=f"Hy3 POST timeout: {e}")
-        except httpx.HTTPError as e:
-            log_event(
-                "error",
-                "upstream.post.error",
-                request_id=request_id,
-                error=f"{type(e).__name__}: {e}",
-                elapsed_ms=round((time.perf_counter() - t_post_start) * 1000, 1),
-            )
-            if record:
-                record.error = f"upstream POST error: {e}"
-            raise HTTPException(status_code=502, detail=f"Hy3 POST failed: {e}")
+    # Use the shared httpx.AsyncClient created in the FastAPI lifespan. This
+    # eliminates per-request TCP+TLS handshakes to the upstream Hy3 host
+    # (~100-300ms saved per request).
+    client = app.state.http_client
 
-        post_latency_ms = round((time.perf_counter() - t_post_start) * 1000, 1)
-        if record:
-            record.upstream_post_status = r.status_code
-            record.upstream_post_latency_ms = post_latency_ms
-
-        if r.status_code != 200:
-            body_preview = r.text[:300]
-            log_event(
-                "error",
-                "upstream.post.non_200",
-                request_id=request_id,
-                status=r.status_code,
-                body=body_preview,
-                elapsed_ms=post_latency_ms,
-            )
-            if record:
-                record.error = f"upstream POST {r.status_code}: {body_preview}"
-            raise HTTPException(
-                status_code=502,
-                detail=f"Hy3 POST failed ({r.status_code}): {body_preview}",
-            )
-
-        try:
-            event_id = r.json().get("event_id")
-        except Exception as e:
-            log_event(
-                "error",
-                "upstream.post.bad_json",
-                request_id=request_id,
-                error=str(e),
-                body=r.text[:300],
-            )
-            if record:
-                record.error = f"upstream POST bad JSON: {e}"
-            raise HTTPException(status_code=502, detail=f"Hy3 POST returned bad JSON: {e}")
-
-        if not event_id:
-            log_event(
-                "error",
-                "upstream.post.no_event_id",
-                request_id=request_id,
-                body=r.text[:300],
-            )
-            if record:
-                record.error = "upstream POST returned no event_id"
-            raise HTTPException(status_code=502, detail="Hy3 returned no event_id")
-
-        if record:
-            record.upstream_event_id = event_id
+    # Step 1: get event_id
+    try:
+        r = await client.post(HY3_BASE, json=payload)
+    except httpx.TimeoutException as e:
         log_event(
-            "info",
-            "upstream.post.ok",
+            "error",
+            "upstream.post.timeout",
             request_id=request_id,
-            event_id=event_id,
+            error=f"{type(e).__name__}: {e}",
+            elapsed_ms=round((time.perf_counter() - t_post_start) * 1000, 1),
+        )
+        if record:
+            record.error = f"upstream POST timeout: {e}"
+        raise HTTPException(status_code=504, detail=f"Hy3 POST timeout: {e}")
+    except httpx.HTTPError as e:
+        log_event(
+            "error",
+            "upstream.post.error",
+            request_id=request_id,
+            error=f"{type(e).__name__}: {e}",
+            elapsed_ms=round((time.perf_counter() - t_post_start) * 1000, 1),
+        )
+        if record:
+            record.error = f"upstream POST error: {e}"
+        raise HTTPException(status_code=502, detail=f"Hy3 POST failed: {e}")
+
+    post_latency_ms = round((time.perf_counter() - t_post_start) * 1000, 1)
+    if record:
+        record.upstream_post_status = r.status_code
+        record.upstream_post_latency_ms = post_latency_ms
+
+    if r.status_code != 200:
+        body_preview = r.text[:300]
+        log_event(
+            "error",
+            "upstream.post.non_200",
+            request_id=request_id,
             status=r.status_code,
+            body=body_preview,
             elapsed_ms=post_latency_ms,
         )
-
-        # Step 2: stream SSE
-        t_stream_start = time.perf_counter()
-        log_event(
-            "info",
-            "upstream.stream.start",
-            request_id=request_id,
-            url=f"{HY3_BASE}/{event_id}",
+        if record:
+            record.error = f"upstream POST {r.status_code}: {body_preview}"
+        raise HTTPException(
+            status_code=502,
+            detail=f"Hy3 POST failed ({r.status_code}): {body_preview}",
         )
 
-        try:
-            async with client.stream("GET", f"{HY3_BASE}/{event_id}") as resp:
-                if resp.status_code != 200:
-                    body = await resp.aread()
-                    body_str = body.decode(errors="replace")[:300]
-                    log_event(
-                        "error",
-                        "upstream.stream.non_200",
-                        request_id=request_id,
-                        status=resp.status_code,
-                        body=body_str,
-                    )
-                    if record:
-                        record.error = f"upstream stream GET {resp.status_code}: {body_str}"
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"Hy3 stream GET failed ({resp.status_code}): {body_str}",
-                    )
-                chunk_count = 0
-                buffer = ""
-                first_chunk_latency_ms: Optional[float] = None
-                async for chunk in resp.aiter_text():
-                    buffer += chunk
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-                        if not line.startswith("data: "):
-                            continue
-                        payload_str = line[6:]
-                        if payload_str in ("", "null", "[DONE]"):
-                            continue
-                        try:
-                            sse_data = json.loads(payload_str)
-                        except json.JSONDecodeError as e:
-                            log_event(
-                                "warning",
-                                "upstream.stream.bad_json",
-                                request_id=request_id,
-                                error=str(e),
-                                line=payload_str[:200],
-                            )
-                            continue
-                        chunk_count += 1
-                        if first_chunk_latency_ms is None:
-                            first_chunk_latency_ms = round(
-                                (time.perf_counter() - t_stream_start) * 1000, 1
-                            )
-                            log_event(
-                                "info",
-                                "upstream.stream.first_chunk",
-                                request_id=request_id,
-                                chunk_index=chunk_count,
-                                ttfb_ms=first_chunk_latency_ms,
-                            )
-                        yield sse_data
+    try:
+        event_id = r.json().get("event_id")
+    except Exception as e:
+        log_event(
+            "error",
+            "upstream.post.bad_json",
+            request_id=request_id,
+            error=str(e),
+            body=r.text[:300],
+        )
+        if record:
+            record.error = f"upstream POST bad JSON: {e}"
+        raise HTTPException(status_code=502, detail=f"Hy3 POST returned bad JSON: {e}")
 
-                stream_total_ms = round((time.perf_counter() - t_stream_start) * 1000, 1)
-                if record:
-                    record.upstream_stream_latency_ms = stream_total_ms
-                    record.upstream_chunks = chunk_count
+    if not event_id:
+        log_event(
+            "error",
+            "upstream.post.no_event_id",
+            request_id=request_id,
+            body=r.text[:300],
+        )
+        if record:
+            record.error = "upstream POST returned no event_id"
+        raise HTTPException(status_code=502, detail="Hy3 returned no event_id")
+
+    if record:
+        record.upstream_event_id = event_id
+    log_event(
+        "info",
+        "upstream.post.ok",
+        request_id=request_id,
+        event_id=event_id,
+        status=r.status_code,
+        elapsed_ms=post_latency_ms,
+    )
+
+    # Step 2: stream SSE.
+    # Hy3 sends cumulative snapshots (each chunk contains the FULL response so far,
+    # not an incremental delta). Both the streaming and non-streaming paths rely on
+    # this invariant — if upstream ever switches to deltas, non-streaming returns
+    # only the final fragment while streaming produces garbled output.
+    t_stream_start = time.perf_counter()
+    log_event(
+        "info",
+        "upstream.stream.start",
+        request_id=request_id,
+        url=f"{HY3_BASE}/{event_id}",
+    )
+
+    try:
+        async with client.stream("GET", f"{HY3_BASE}/{event_id}") as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                body_str = body.decode(errors="replace")[:300]
                 log_event(
-                    "info",
-                    "upstream.stream.done",
+                    "error",
+                    "upstream.stream.non_200",
                     request_id=request_id,
-                    chunks=chunk_count,
-                    elapsed_ms=stream_total_ms,
+                    status=resp.status_code,
+                    body=body_str,
                 )
-        except httpx.TimeoutException as e:
-            log_event(
-                "error",
-                "upstream.stream.timeout",
-                request_id=request_id,
-                error=f"{type(e).__name__}: {e}",
-                elapsed_ms=round((time.perf_counter() - t_stream_start) * 1000, 1),
-            )
+                if record:
+                    record.error = f"upstream stream GET {resp.status_code}: {body_str}"
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Hy3 stream GET failed ({resp.status_code}): {body_str}",
+                )
+            chunk_count = 0
+            first_chunk_latency_ms: Optional[float] = None
+            # Use aiter_lines() for SSE framing — it handles newline splitting
+            # internally and avoids the O(n²) buffer += chunk pattern. The buffer
+            # is also naturally bounded by the HTTP_TIMEOUT if the upstream sends
+            # no newlines (aiter_lines will block until a line or timeout).
+            async for line in resp.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data: "):
+                    continue
+                payload_str = line[6:]
+                if payload_str in ("", "null", "[DONE]"):
+                    continue
+                try:
+                    sse_data = json.loads(payload_str)
+                except json.JSONDecodeError as e:
+                    log_event(
+                        "warning",
+                        "upstream.stream.bad_json",
+                        request_id=request_id,
+                        error=str(e),
+                        line=payload_str[:200],
+                    )
+                    continue
+                chunk_count += 1
+                if first_chunk_latency_ms is None:
+                    first_chunk_latency_ms = round(
+                        (time.perf_counter() - t_stream_start) * 1000, 1
+                    )
+                    log_event(
+                        "info",
+                        "upstream.stream.first_chunk",
+                        request_id=request_id,
+                        chunk_index=chunk_count,
+                        ttfb_ms=first_chunk_latency_ms,
+                    )
+                yield sse_data
+
+            stream_total_ms = round((time.perf_counter() - t_stream_start) * 1000, 1)
             if record:
-                record.error = f"upstream stream timeout: {e}"
-            raise HTTPException(status_code=504, detail=f"Hy3 stream timeout: {e}")
-        except httpx.HTTPError as e:
+                record.upstream_stream_latency_ms = stream_total_ms
+                record.upstream_chunks = chunk_count
             log_event(
-                "error",
-                "upstream.stream.error",
+                "info",
+                "upstream.stream.done",
                 request_id=request_id,
-                error=f"{type(e).__name__}: {e}",
-                elapsed_ms=round((time.perf_counter() - t_stream_start) * 1000, 1),
+                chunks=chunk_count,
+                elapsed_ms=stream_total_ms,
             )
-            if record:
-                record.error = f"upstream stream error: {e}"
-            raise HTTPException(status_code=502, detail=f"Hy3 stream failed: {e}")
+    except httpx.TimeoutException as e:
+        log_event(
+            "error",
+            "upstream.stream.timeout",
+            request_id=request_id,
+            error=f"{type(e).__name__}: {e}",
+            elapsed_ms=round((time.perf_counter() - t_stream_start) * 1000, 1),
+        )
+        if record:
+            record.error = f"upstream stream timeout: {e}"
+        raise HTTPException(status_code=504, detail=f"Hy3 stream timeout: {e}")
+    except httpx.HTTPError as e:
+        log_event(
+            "error",
+            "upstream.stream.error",
+            request_id=request_id,
+            error=f"{type(e).__name__}: {e}",
+            elapsed_ms=round((time.perf_counter() - t_stream_start) * 1000, 1),
+        )
+        if record:
+            record.error = f"upstream stream error: {e}"
+        raise HTTPException(status_code=502, detail=f"Hy3 stream failed: {e}")
+
+
+def _safe_idx(lst: list, i: int, default: Any) -> Any:
+    """Safely index a list, returning default if out of range or falsy."""
+    if i < len(lst) and lst[i]:
+        return lst[i]
+    return default
 
 
 def parse_hy3_data(data: list) -> tuple[str, str, list, list]:
@@ -665,11 +766,10 @@ def parse_hy3_data(data: list) -> tuple[str, str, list, list]:
     inner = data[0]
     if not isinstance(inner, list) or not inner:
         return "", "", [], []
-    # `not inner` above guarantees len(inner) > 0, so inner[0] is safe.
-    resp = inner[0] if inner[0] else ""
-    think = inner[1] if len(inner) > 1 and inner[1] else ""
-    tools = inner[2] if len(inner) > 2 and inner[2] else []
-    hist = inner[3] if len(inner) > 3 and inner[3] else []
+    resp = _safe_idx(inner, 0, "")
+    think = _safe_idx(inner, 1, "")
+    tools = _safe_idx(inner, 2, [])
+    hist = _safe_idx(inner, 3, [])
     return resp or "", think or "", tools or [], hist or []
 
 
@@ -830,10 +930,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         # Also allow raw API key in x-api-key header (some clients use this)
         if not token:
             token = request.headers.get("x-api-key", "").strip()
-        # use constant-time comparison to prevent timing attacks. Compare
-        # against each configured key with hmac.compare_digest so attackers cannot
-        # distinguish "valid prefix" from "invalid" via response timing.
-        authorized = any(hmac.compare_digest(token, k) for k in API_KEYS)
+        # Use constant-time comparison to prevent timing attacks. We iterate
+        # over ALL keys (no short-circuit via any()) so the comparison count
+        # doesn't leak which key matched. _constant_time_match encodes to bytes
+        # to avoid TypeError on non-ASCII tokens.
+        authorized = False
+        for k in API_KEYS:
+            if _constant_time_match(token, k):
+                authorized = True
         if not authorized:
             client_ip = request.client.host if request.client else "unknown"
             log_event(
@@ -864,7 +968,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             if s:
                 record.user_message_preview = s[:100]
                 break
-    record.has_history = len(req.messages) > 1
+    # Note: has_history is set after messages_to_hy3() below, from the actual
+    # history list (a single system + single user message has history=[]).
 
     # Resolve the final think_level BEFORE logging request.start so the log shows
     # the actual value sent upstream (was previously logged as the pre-override
@@ -895,6 +1000,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     )
 
     msg, sys_prompt, history = messages_to_hy3(req.messages)
+    record.has_history = bool(history)  # set from actual history, not message count
     # Validation must accept any message flow that includes a user turn somewhere
     # in the conversation, not just a non-empty last message. Tool result
     # round-trips legitimately end with role=tool and content may be null.
@@ -995,22 +1101,27 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             },
         )
 
-    # Non-streaming: collect full response; release the slot in finally
+    # Non-streaming: collect full response. The _slot context manager handles
+    # limiter release in both success and error paths (no manual try/finally).
     final_resp = ""
     final_think = ""
     final_tools: list = []
-    errored = False
     try:
-        async for data in call_hy3_stream(payload, request_id=request_id, record=record):
-            resp, think, tools, _ = parse_hy3_data(data)
-            if resp:
-                final_resp = resp
-            if think:
-                final_think = think
-            if tools:
-                final_tools = tools
+        async with _slot(limiter):
+            async for data in call_hy3_stream(payload, request_id=request_id, record=record):
+                # Hy3 sends cumulative snapshots: each chunk contains the FULL
+                # response so far. We replace (not append) to keep only the latest.
+                # If upstream ever switches to incremental deltas, this would
+                # return only the final fragment — the streaming path has the
+                # same assumption (see call_hy3_stream docstring).
+                resp, think, tools, _ = parse_hy3_data(data)
+                if resp:
+                    final_resp = resp
+                if think:
+                    final_think = think
+                if tools:
+                    final_tools = tools
     except HTTPException as e:
-        errored = True
         record.status_code = e.status_code
         record.error = str(e.detail)[:300]
         log_event(
@@ -1022,7 +1133,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         )
         raise
     except Exception as e:
-        errored = True
         record.status_code = 502
         record.error = str(e)[:300]
         log_event(
@@ -1032,8 +1142,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             error=f"{type(e).__name__}: {e}",
         )
         raise HTTPException(status_code=502, detail=f"Hy3 call failed: {e}")
-    finally:
-        limiter.release(errored=errored)
 
     record.response_chars = len(final_resp)
     record.response_thinking_chars = len(final_think)
@@ -1103,6 +1211,11 @@ async def stream_openai(
     `limiter` is required — the caller must have already acquired a slot, and
     this function releases it in the finally block. Passing None would leak
     the slot, so the parameter is mandatory.
+
+    Note: we use a manual try/finally rather than the _slot context manager
+    because this is an async generator — the yield points make context manager
+    semantics tricky (the body suspends at each yield). The finally block
+    runs on both normal completion and client disconnect (generator.close()).
     """
     last_resp_len = 0
     last_think_len = 0
@@ -1213,8 +1326,9 @@ def _require_admin(request: Request):
     token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
     if not token:
         token = request.headers.get("x-admin-token", "").strip()
-    # use constant-time comparison to prevent timing attacks on admin token.
-    if not hmac.compare_digest(token, ADMIN_TOKEN):
+    # Use constant-time comparison to prevent timing attacks on admin token.
+    # _constant_time_match encodes to bytes to avoid TypeError on non-ASCII.
+    if not _constant_time_match(token, ADMIN_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 

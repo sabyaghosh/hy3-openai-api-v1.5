@@ -126,8 +126,8 @@ class RequestRecord:
         # Upstream Hy3 details
         self.upstream_event_id: Optional[str] = None
         self.upstream_post_status: Optional[int] = None
-        self.upstream_post_latency_ms: Optional[int] = None
-        self.upstream_stream_latency_ms: Optional[int] = None
+        self.upstream_post_latency_ms: Optional[float] = None
+        self.upstream_stream_latency_ms: Optional[float] = None
         self.upstream_chunks: int = 0
         # Response details
         self.response_chars: int = 0
@@ -136,7 +136,7 @@ class RequestRecord:
         self.finish_reason: Optional[str] = None
         # Concurrency at the time of request
         self.concurrency_active_at_start: Optional[int] = None
-        self.queued_ms: Optional[int] = None
+        self.queued_ms: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {

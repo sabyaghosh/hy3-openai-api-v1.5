@@ -15,9 +15,9 @@ services:
     autoDeploy: true
     envVars:
       - key: HOST
-        value: 0.0.0.0
+        value: "0.0.0.0"
       - key: PORT
-        value: 8000
+        value: "8000"
       - key: PYTHONUNBUFFERED
         value: "1"
       # Concurrency control — fail fast with 503 instead of timing out at the gateway

@@ -106,12 +106,17 @@ if [[ -n "$CONV_ID" ]]; then
   fi
 fi
 
-# Load tools JSON
+# Load tools JSON — validate that it's either a readable file or valid JSON.
 TOOLS_DATA="[]"
 if [[ -n "$TOOLS_JSON" ]]; then
   if [[ -f "$TOOLS_JSON" ]]; then
     TOOLS_DATA="$(cat "$TOOLS_JSON")"
   else
+    # Not a file — treat as inline JSON. Validate it parses.
+    if ! echo "$TOOLS_JSON" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
+      echo "Error: -f argument is neither a readable file nor valid JSON: $TOOLS_JSON" >&2
+      exit 1
+    fi
     TOOLS_DATA="$TOOLS_JSON"
   fi
 fi
@@ -141,29 +146,52 @@ print(json.dumps({'data': [msg, sp, hist, tl, temp, mt, tp, pt, json.dumps(tools
 PAYLOAD="$(build_payload)"
 
 # Step 1: POST to get event_id
-# add --max-time to prevent hanging forever if upstream is unresponsive.
+# Capture curl exit code separately so we can report it accurately.
 RESPONSE=$(curl -sf --max-time 30 -X POST "$BASE" \
   -H "Content-Type: application/json" \
-  -d "$PAYLOAD")
+  -d "$PAYLOAD" 2>/dev/null)
+curl_rc=$?
+if [[ $curl_rc -ne 0 ]]; then
+  echo "Error: Hy3 POST failed (curl exit $curl_rc)" >&2
+  echo "  (28=timeout, 22=HTTP error, 6=DNS, 7=connection refused)" >&2
+  exit 1
+fi
 
-EVENT_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['event_id'])")
+# Extract event_id, with error handling for unexpected JSON.
+EVENT_ID=$(echo "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('event_id', ''))
+except Exception as e:
+    print(f'Error: failed to parse event_id from response: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>&1) || {
+  echo "$EVENT_ID" >&2
+  exit 1
+}
 
 if [[ -z "$EVENT_ID" ]]; then
-  echo "Error: failed to get event_id" >&2
+  echo "Error: Hy3 returned no event_id" >&2
+  echo "  Response: ${RESPONSE:0:200}" >&2
   exit 1
 fi
 
 # Step 2: Stream and save everything to a temp file, then replay
-# add --max-time to prevent hanging forever on a stalled stream.
+# --max-time prevents hanging forever on a stalled stream.
 TMPFILE=$(mktemp)
 ERRFILE=$(mktemp)
-trap "rm -f '$TMPFILE' '$ERRFILE'" EXIT
+# Trap on EXIT, INT, TERM so temp files are cleaned even on signal.
+trap 'rm -f "$TMPFILE" "$ERRFILE"' EXIT INT TERM
 
-# Don't swallow curl errors. Capture exit code + check for empty output.
-# redirect stderr to a separate file (was 2>&1 which mixed errors into the
-# SSE data, breaking the JSON parser). Now errors go to ERRFILE for diagnostics.
-if ! curl -sf --max-time 300 -N "${BASE}/${EVENT_ID}" > "$TMPFILE" 2>"$ERRFILE"; then
-  echo "Error: failed to fetch Hy3 stream (curl exit $?)" >&2
+# Capture curl exit code BEFORE the if-block — inside `if !`, $? reflects the
+# if evaluation, not curl. We need the real curl code to distinguish timeout
+# (28) from HTTP error (22) from DNS failure (6).
+curl -sf --max-time 300 -N "${BASE}/${EVENT_ID}" > "$TMPFILE" 2>"$ERRFILE"
+curl_rc=$?
+if [[ $curl_rc -ne 0 ]]; then
+  echo "Error: failed to fetch Hy3 stream (curl exit $curl_rc)" >&2
+  echo "  (28=timeout, 22=HTTP error, 6=DNS, 7=connection refused)" >&2
   if [[ -s "$ERRFILE" ]]; then
     echo "--- curl stderr ---" >&2
     head -c 500 "$ERRFILE" >&2
@@ -217,7 +245,7 @@ for line in lines:
 
         resp_text = data[0][0] or ''
         think_text = data[0][1] if len(data[0]) > 1 and data[0][1] else ''
-        tool_calls = data[0][2] if len(data[0]) > 2 and data[0][2] else []
+        # tool_calls are handled after the loop from final_data — not here.
 
         if mode == 'stream':
             if think_text and len(think_text) > last_think:

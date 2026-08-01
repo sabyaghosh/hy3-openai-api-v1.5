@@ -215,6 +215,9 @@ Point any OpenAI-compatible client at `http://localhost:8000/v1` with any API ke
 | `PYTHONUNBUFFERED` | — | Set to `1` for unbuffered logs |
 | `MAX_CONCURRENT` | `10` | Hard cap of in-flight Hy3 calls. Excess requests get queued (see `QUEUE_TIMEOUT`) |
 | `QUEUE_TIMEOUT` | `5` | Seconds to wait for a free slot before returning `503` with `Retry-After`. Set to `0` for non-blocking |
+| `HTTP_READ_TIMEOUT` | `90` | Upstream read timeout in seconds. Default 90 (below Render's ~100s gateway). Set to `300` on platforms without a gateway timeout (Fly, Cloud Run) for long thinking generations |
+| `PRESERVED_THINKING` | `true` | Whether Hy3 includes reasoning text in the response. Set to `false` to disable `reasoning_content` (reduces latency and token counts) |
+| `SSE_BUFFER_CAP` | `10000000` | Cap on SSE line buffer in bytes (DoS protection against malformed upstream). Default 10MB |
 | `LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
 | `API_KEYS` | _(empty)_ | Comma-separated API keys. If set, `/v1/chat/completions` requires `Authorization: Bearer <key>` |
 | `ADMIN_TOKEN` | _(empty)_ | Secret token for `/admin/*` endpoints. If unset, admin endpoints return 404 |

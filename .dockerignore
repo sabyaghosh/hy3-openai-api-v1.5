@@ -29,6 +29,3 @@ env/
 # Docker
 Dockerfile
 .dockerignore
-
-# Docs (not needed at runtime — but we COPY them; ignore extras)
-docs/
