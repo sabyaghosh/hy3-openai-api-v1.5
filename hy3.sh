@@ -89,6 +89,21 @@ if ! [[ "$MAX_TOKENS" =~ ^[0-9]+$ ]] || [[ "$MAX_TOKENS" -lt 1 ]]; then
   exit 1
 fi
 
+# Validate -T / -p too. They are interpolated into build_payload's `json.loads`
+# arguments, so a non-numeric value produced a raw Python traceback rather than
+# a usage error.
+_is_number() {
+  [[ "$1" =~ ^-?([0-9]+(\.[0-9]*)?|\.[0-9]+)$ ]]
+}
+if [[ -n "$TEMPERATURE" ]] && ! _is_number "$TEMPERATURE"; then
+  echo "Error: -T must be a number (got: $TEMPERATURE)" >&2
+  exit 1
+fi
+if [[ -n "$TOP_P" ]] && ! _is_number "$TOP_P"; then
+  echo "Error: -p must be a number (got: $TOP_P)" >&2
+  exit 1
+fi
+
 # Get prompt from arg or stdin
 if [[ $# -gt 0 ]]; then
   PROMPT="$*"
@@ -175,6 +190,11 @@ fi
 
 # Extract event_id, with error handling for unexpected JSON.
 # Note: capture stdout only; let stderr go to the console for diagnostics.
+# Use the `|| rc=$?` idiom: under `set -e` a failing command substitution in an
+# assignment terminates the shell immediately, so a following `if [[ $? -ne 0 ]]`
+# is unreachable dead code. `set -o pipefail` makes the pipeline report python3's
+# exit status.
+parse_rc=0
 EVENT_ID=$(echo "$RESPONSE" | python3 -c "
 import sys, json
 try:
@@ -183,8 +203,8 @@ try:
 except Exception as e:
     sys.stderr.write(f'Error: failed to parse event_id from response: {e}\n')
     sys.exit(1)
-")
-if [[ $? -ne 0 ]]; then
+") || parse_rc=$?
+if [[ $parse_rc -ne 0 ]]; then
   echo "Error: failed to parse event_id from Hy3 response" >&2
   echo "  Response: ${RESPONSE:0:200}" >&2
   exit 1
@@ -198,11 +218,22 @@ fi
 
 # Step 2: Stream and save everything to a temp file, then replay
 # --max-time prevents hanging forever on a stalled stream.
-# Register the cleanup trap after the FIRST mktemp so a failure in the second
-# doesn't leak the first file. The trap references both vars (set to the paths
-# once created; empty strings are safely ignored by rm -f).
+#
+# Pre-initialise BOTH vars to "" and install the trap before either mktemp, so
+# that a failure in either one still runs a well-defined cleanup. Previously the
+# trap was installed between the two mktemp calls while referencing $ERRFILE; if
+# the second mktemp failed, `set -u` made the trap itself abort with
+# "ERRFILE: unbound variable", hiding the real error. `${VAR:-}` inside the
+# handler is belt-and-braces against the same class of bug.
+TMPFILE=""
+ERRFILE=""
+_cleanup() {
+  [[ -n "${TMPFILE:-}" ]] && rm -f "$TMPFILE"
+  [[ -n "${ERRFILE:-}" ]] && rm -f "$ERRFILE"
+  return 0  # never let cleanup change the script's exit status
+}
+trap _cleanup EXIT INT TERM
 TMPFILE=$(mktemp)
-trap 'rm -f "$TMPFILE" "$ERRFILE"' EXIT INT TERM
 ERRFILE=$(mktemp)
 
 # Capture curl exit code using `|| rc=$?` idiom (set -e-safe).

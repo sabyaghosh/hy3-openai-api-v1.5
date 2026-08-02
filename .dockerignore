@@ -10,6 +10,19 @@ __pycache__/
 venv/
 env/
 
+# uv toolchain artifacts — Dockerfile.dev installs a full CPython tree here.
+# Without this, the build context balloons by hundreds of MB.
+.python/
+.uv-cache/
+
+# Secrets — must never enter the build context
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
 # Local state
 .hy3_state/
 *.log

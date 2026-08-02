@@ -45,8 +45,9 @@ if not logger.handlers:
 # ----------------------- Ring buffer -----------------------
 
 BUFFER_SIZE = 2000  # keep last 2000 log entries
+REQUEST_BUFFER_SIZE = 200  # keep last 200 request summaries
 LOG_BUFFER: deque = deque(maxlen=BUFFER_SIZE)
-REQUEST_BUFFER: deque = deque(maxlen=200)  # last 200 request summaries
+REQUEST_BUFFER: deque = deque(maxlen=REQUEST_BUFFER_SIZE)
 
 
 def _truncate(s: Any, n: int = 500) -> Any:
@@ -186,6 +187,17 @@ class RequestRecord:
             "queued_ms": self.queued_ms,
         }
 
+    @property
+    def finalized(self) -> bool:
+        """Public read-only view of the finalize guard.
+
+        Callers in cleanup paths (e.g. an async generator's `finally` block on
+        client disconnect) need to know whether the record already made it into
+        REQUEST_BUFFER, so they can stamp a terminal status before finalizing.
+        Exposed as a property so they don't have to touch `_finalized`.
+        """
+        return self._finalized
+
     def finalize(self) -> None:
         # Idempotent — safe to call multiple times.
         if self._finalized:
@@ -204,7 +216,14 @@ def get_recent_logs(
     request_id: Optional[str] = None,
     event: Optional[str] = None,
 ) -> list[dict]:
-    """Return recent log entries, newest first, filtered by criteria."""
+    """Return recent log entries, newest first, filtered by criteria.
+
+    `limit <= 0` returns an empty list. Without this guard the append-then-test
+    loop below emits one entry for limit=0, and a negative limit behaves the
+    same as limit=1 — both reachable from the /admin/logs query string.
+    """
+    if limit <= 0:
+        return []
     out = []
     entries = list(LOG_BUFFER)
     entries.reverse()  # newest first
@@ -222,7 +241,14 @@ def get_recent_logs(
 
 
 def get_recent_requests(limit: int = 50, errors_only: bool = False) -> list[dict]:
-    """Return recent request records, newest first."""
+    """Return recent request records, newest first.
+
+    `limit <= 0` returns an empty list. Guard is required because `entries[:limit]`
+    with a negative limit silently returns "all but the last N" records rather
+    than nothing — a confusing result for `/admin/requests?limit=-5`.
+    """
+    if limit <= 0:
+        return []
     entries = list(REQUEST_BUFFER)
     entries.reverse()
     if errors_only:

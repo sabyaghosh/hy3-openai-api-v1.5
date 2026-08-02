@@ -60,11 +60,14 @@ from typing import Any, AsyncIterator, Literal, Optional, Union
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from logging_layer import (
+    REQUEST_BUFFER_SIZE,
     RequestRecord,
     get_log_summary,
     get_recent_logs,
@@ -85,7 +88,9 @@ DEFAULT_THINK_LEVEL = "no_think"
 
 # Single source of truth for the version string. Used by both the FastAPI app
 # metadata (visible at /docs, /openapi.json) and the / endpoint.
-__version__ = "1.4.4"
+# Keep in sync with: pyproject.toml [project].version and the CHANGELOG.md
+# top entry. (1.4.2-1.4.4 were never released — no changelog entries existed.)
+__version__ = "1.4.5"
 
 # ----------------------- Env var parsing -----------------------
 
@@ -188,9 +193,16 @@ MAX_BODY_BYTES = _parse_int_env("MAX_BODY_BYTES", 8_000_000, min_val=1024)
 
 # Cap on a single SSE line from upstream. aiter_lines() is unbounded if the
 # upstream sends no newline, so we check each line's length explicitly.
-# Default 10MB — the largest legitimate payload with max_tokens=262144 is
-# well under 2MB.
+# Default 10MB — with DEFAULT_MAX_TOKENS=4096 a legitimate cumulative snapshot
+# is well under 1MB, and even an explicit max_tokens=262144 stays under ~2MB.
 SSE_BUFFER_CAP = _parse_int_env("SSE_BUFFER_CAP", 10_000_000, min_val=1024)
+
+# Whether to trust X-Forwarded-For / X-Real-IP headers. Default true because
+# every documented deployment platform puts a proxy in front of this service.
+# Set TRUST_PROXY_HEADERS=false when exposing the port directly, otherwise any
+# caller can spoof their logged client IP.
+# NOTE: must be defined here, ABOVE _client_ip(), which reads it.
+TRUST_PROXY_HEADERS = _parse_bool_env("TRUST_PROXY_HEADERS", True)
 
 
 @asynccontextmanager
@@ -240,6 +252,69 @@ async def _limit_body_size(request: Request, call_next):
     return await call_next(request)
 
 
+# ----------------------- OpenAI-shaped error responses -----------------------
+# FastAPI's default error body is {"detail": ...}; Pydantic validation errors are
+# {"detail": [ ... ]}. OpenAI clients parse {"error": {"message", "type", "code"}}.
+# Previously only the 503 and 413 paths used the OpenAI shape, so 400/401/404/422/
+# 502/504 surfaced in the SDK as opaque errors with no usable message. These two
+# handlers normalise every error response to the OpenAI envelope.
+
+_ERROR_TYPE_BY_STATUS = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "payload_too_large",
+    422: "invalid_request_error",
+    429: "rate_limit_error",
+    500: "internal_error",
+    502: "upstream_error",
+    503: "server_at_capacity",
+    504: "upstream_timeout",
+}
+
+
+def _openai_error(
+    status_code: int, message: str, code: Optional[str] = None
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": _ERROR_TYPE_BY_STATUS.get(status_code, "api_error"),
+                "code": code,
+            }
+        },
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException):
+    # Registered on Starlette's HTTPException (FastAPI's subclasses it), so this
+    # also covers router-raised 404/405. Preserve any headers the raiser attached
+    # (e.g. Retry-After, WWW-Authenticate).
+    resp = _openai_error(exc.status_code, str(exc.detail))
+    if exc.headers:
+        resp.headers.update(exc.headers)
+    return resp
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    # Build the message from strings only. exc.errors() can embed a raw ValueError
+    # under ctx["error"], which is not JSON-serialisable — returning it verbatim
+    # would turn a 422 into a 500.
+    parts: list[str] = []
+    for err in exc.errors():
+        loc = ".".join(str(x) for x in err.get("loc", ()) if x != "body")
+        msg = str(err.get("msg", "invalid value"))
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return _openai_error(
+        422, "; ".join(parts) or "Invalid request", code="validation_error"
+    )
+
+
 def _client_ip(request: Request) -> str:
     """Extract the client IP, preferring X-Forwarded-For when behind a proxy.
 
@@ -254,10 +329,6 @@ def _client_ip(request: Request) -> str:
             return xff.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
-
-# Whether to trust X-Forwarded-For / X-Real-IP headers. Default true because
-# every documented deployment platform puts a proxy in front of this service.
-TRUST_PROXY_HEADERS = _parse_bool_env("TRUST_PROXY_HEADERS", True)
 
 # CORS — allow the Next.js admin panel (and any OpenAI client) to call this API.
 # Configure allowed origins via ADMIN_ORIGIN env var (default: permissive for dev).
@@ -1477,6 +1548,23 @@ async def stream_openai(
             record.finalize()
         log_event("error", "stream.unhandled_error", request_id=request_id, error=f"{type(e).__name__}: {e}")
     finally:
+        # Client disconnect raises GeneratorExit at the yield point. GeneratorExit
+        # derives from BaseException, so NEITHER `except HTTPException` nor
+        # `except Exception` above catches it — without this block the record is
+        # never finalized and the aborted stream is invisible in /admin/requests.
+        # finalize() is idempotent, but we only stamp 499 when nothing else has.
+        if record is not None and not record.finalized:
+            record.status_code = 499  # nginx convention: client closed request
+            record.error = record.error or "client disconnected mid-stream"
+            record.finish_reason = record.finish_reason or "cancelled"
+            record.finalize()
+            log_event(
+                "warning",
+                "stream.client_disconnected",
+                request_id=request_id,
+                response_chars=last_resp_len,
+                thinking_chars=last_think_len,
+            )
         # ALWAYS release the limiter slot — even on client disconnect.
         # Without this, an aborted stream would leak the slot forever.
         # limiter is guaranteed non-None (required parameter).
@@ -1560,8 +1648,14 @@ async def admin_logs_summary(request: Request):
 async def admin_request_detail(request: Request, request_id: str):
     """Get a single request record + all log entries for it."""
     _require_admin(request)
-    # REQUEST_BUFFER maxes at 200, so use the actual buffer cap.
-    requests = [r for r in get_recent_requests(limit=200) if r["request_id"] == request_id]
+    # Scan the whole request ring buffer. Import the cap from logging_layer
+    # rather than hardcoding 200 — a literal here silently truncates the scan
+    # if REQUEST_BUFFER_SIZE is ever raised.
+    requests = [
+        r
+        for r in get_recent_requests(limit=REQUEST_BUFFER_SIZE)
+        if r["request_id"] == request_id
+    ]
     logs = get_recent_logs(limit=500, request_id=request_id)
     if not requests and not logs:
         raise HTTPException(status_code=404, detail=f"Request {request_id} not found")

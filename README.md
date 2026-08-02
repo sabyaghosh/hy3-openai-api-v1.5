@@ -26,6 +26,26 @@ A production-ready OpenAI-compatible API proxy for [Tencent Hy3](https://hugging
 
 ## 📦 What's New
 
+### v1.4.5 (Code-Review Release)
+
+Full line-by-line review of the repo. Highlights:
+
+- **`pyproject.toml` added — fixes a startup crash on Diploi.** `diploi.yaml` runs
+  `uv run --with uvicorn uvicorn server:app`, and `uv run` resolves deps from
+  `pyproject.toml`, **not** `requirements.txt`. Without it the venv contained only
+  `uvicorn` and the app died on `import fastapi`.
+- **`.python/` is now git/docker-ignored** — `Dockerfile.dev` unpacks a full CPython
+  tree into the repo root via `UV_PYTHON_INSTALL_DIR`
+- **CI unused-constant check actually works now** — it compared against every
+  `ast.Name` including assignment targets, so it could never report anything
+- **Cancelled streams are recorded** — `GeneratorExit` on client disconnect bypassed
+  both `except` clauses, so aborted streams never reached `/admin/requests`
+- **All errors use the OpenAI `{"error": {...}}` envelope** — previously only 503/413 did
+- **`hy3.sh`**: unreachable `event_id` error handler under `set -e`, unbound `$ERRFILE`
+  in the EXIT trap, and unvalidated `-T`/`-p` flags
+- **`/admin/*` `limit=0` / negative `limit`** no longer return bogus result sets
+- See [CHANGELOG.md](CHANGELOG.md) for the full list
+
 ### v1.4.0 (Review-Fix Release)
 
 Follow-up fix release addressing issues found in a post-1.3.0 code review:
@@ -262,7 +282,7 @@ resp = client.chat.completions.create(
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/` | GET | — | Service info |
-| `/health` | GET | — | Liveness probe — returns 503 if `active_requests > max_concurrent` (counter overflow) OR if `total_errors > 50%` of `total_acquired` (with ≥10 total acquired, indicating systemic upstream failures) |
+| `/health` | GET | — | Liveness probe — returns 503 when more than 50% of the **last 50** requests errored, and the window holds at least 10 requests. The window slides, so health recovers automatically once bad requests age out; a single upstream blip will not brick the service. Response includes `recent_window` and `recent_error_rate`. |
 | `/stats` | GET | — | Runtime counters (active, peak, rejected, completed) |
 | `/v1/models` | GET | — | OpenAI models list |
 | `/v1/chat/completions` | POST | `API_KEYS` (if set) | OpenAI chat completion (streaming + non-streaming) |

@@ -1,0 +1,29 @@
+[project]
+name = "hy3-openai-api"
+# Keep in sync with server.py __version__ and the CHANGELOG.md top entry.
+version = "1.4.5"
+description = "OpenAI-compatible API proxy for Tencent Hy3 295B MoE via HuggingFace Gradio API"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110,<0.120",
+    "uvicorn[standard]>=0.27,<0.35",
+    "httpx>=0.27,<0.30",
+    "pydantic>=2.5,<3.0",
+]
+
+# This repo is a flat script layout (server.py / logging_layer.py at the root),
+# not an installable package. `package = false` tells uv to build a venv from
+# `dependencies` WITHOUT trying to build/install this project itself.
+#
+# Why this file exists: diploi.yaml launches the app with
+#   uv run --with uvicorn uvicorn server:app ...
+# `uv run` resolves deps from pyproject.toml — it does NOT read requirements.txt.
+# Without this file the runtime env would contain only uvicorn and the app would
+# crash on `import fastapi`.
+#
+# NOTE: requirements.txt is kept in sync for the standalone Dockerfile (which
+# uses plain `pip install -r requirements.txt`). Update BOTH when bumping deps.
+[tool.uv]
+package = false

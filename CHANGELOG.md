@@ -5,6 +5,82 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.5] — 2025-08-03
+
+Full line-by-line code review of the repository. Note that `server.py` had been
+bumped to `1.4.4` without any corresponding `1.4.2`/`1.4.3`/`1.4.4` changelog
+entries or README updates; this release reconciles the version across
+`server.py`, `pyproject.toml`, and this file.
+
+### 🔴 Critical
+
+- **`pyproject.toml` added — the Diploi deployment could not start.** `diploi.yaml`
+  launches the app with `uv run --with uvicorn uvicorn server:app`. `uv run`
+  resolves dependencies from `pyproject.toml` (or PEP-723 inline metadata) and
+  **does not read `requirements.txt`**, so the runtime venv contained only
+  `uvicorn` and the app crashed on `import fastapi`. `requirements.txt` is
+  retained for the standalone `Dockerfile`, which uses `pip install -r`.
+- **`.python/` added to `.gitignore` and `.dockerignore`.** `Dockerfile.dev` sets
+  `UV_PYTHON_INSTALL_DIR=$FOLDER/.python`, so uv unpacks a complete CPython tree
+  (hundreds of MB) into the repo root. It was ignored by neither file and would
+  have been committed to Git and shipped into the Docker build context.
+- **CI "unreferenced constants" check was a permanent no-op.** `used` was built
+  from every `ast.Name` node, but an assignment *target* is itself an `ast.Name`,
+  so `defined - used` was always empty. The check reported success on every run
+  and could never have caught the `SSE_BUFFER_CAP`-class bug it was written for.
+  `used` is now restricted to `ast.Load` contexts, and `logging_layer.py` is
+  scanned too.
+
+### 🟠 High
+
+- **Aborted streams were never recorded.** A client disconnect raises
+  `GeneratorExit` at a `yield` in `stream_openai`. `GeneratorExit` derives from
+  `BaseException`, so neither `except HTTPException` nor `except Exception`
+  caught it, and `record.finalize()` was never reached — every cancelled stream
+  vanished from `/admin/requests`. The `finally` block now stamps `499` and
+  finalizes. Added `RequestRecord.finalized` as a public view of the guard so
+  cleanup paths don't touch `_finalized`.
+- **`hy3.sh`: `set -e` made the `event_id` error handler unreachable.** The
+  `if [[ $? -ne 0 ]]` check after `EVENT_ID=$(... python3 ...)` was dead code —
+  `set -e` aborts the script on the failing command substitution before the check
+  runs. Converted to the `|| rc=$?` idiom already used for the `curl` calls.
+- **`hy3.sh`: `$ERRFILE` was unbound inside the EXIT trap.** The trap referencing
+  `"$ERRFILE"` is installed *before* `ERRFILE=$(mktemp)`. Under `set -u`, if the
+  second `mktemp` fails the trap dies with `ERRFILE: unbound variable`, masking
+  the real error. Both vars are now pre-initialised and expanded with `${…:-}`.
+
+### 🟡 Medium
+
+- **Error responses are now OpenAI-shaped.** Only the 503 and 413 paths returned
+  `{"error": {...}}`; every `raise HTTPException(...)` (401/400/502/504, admin
+  404) returned FastAPI's `{"detail": ...}` and 422s returned `{"detail": [...]}`.
+  OpenAI SDK clients parse `error.message`, so these surfaced as opaque failures.
+  Added `StarletteHTTPException` and `RequestValidationError` handlers. The 422
+  handler builds its message from strings only — `exc.errors()` can embed a raw
+  `ValueError` under `ctx`, which is not JSON-serialisable and would turn a 422
+  into a 500.
+- **`limit <= 0` handling in `logging_layer` query helpers.** `get_recent_logs`
+  appends before testing `len(out) >= limit`, so `?limit=0` returned one entry.
+  `get_recent_requests` used `entries[:limit]`, so `?limit=-5` returned *all but
+  the last five* records. Both now return `[]`.
+- **`hy3.sh`: `-T`/`-p` are now validated.** `-t` and `-m` were checked but
+  temperature/top-p were passed straight to `json.loads`, so a non-numeric value
+  produced a raw Python traceback instead of a usage error.
+
+### 🔵 Low / Docs
+
+- **`TRUST_PROXY_HEADERS` moved above `_client_ip()`**, which reads it. It
+  previously worked only because the global is resolved at call time.
+- **`REQUEST_BUFFER_SIZE` exported** from `logging_layer` and used by
+  `/admin/requests/{id}` instead of a hardcoded `200`, which would silently
+  truncate the scan if the buffer cap were raised.
+- **Stale `SSE_BUFFER_CAP` comment fixed** — still cited `max_tokens=262144` as
+  the sizing basis after `DEFAULT_MAX_TOKENS` was lowered to 4096.
+- **README `/health` description corrected** — documented a "counter overflow
+  (`active_requests > max_concurrent`)" 503 condition that the implementation
+  does not contain. The endpoint only checks the 50-request sliding error window.
+- **`.dockerignore` now excludes `.env*`, `*.key`, `*.pem`, and `secrets/`.**
+
 ## [1.4.1] — 2026-08-02
 
 Second-pass cleanup addressing dead code, wrong comments, and documentation

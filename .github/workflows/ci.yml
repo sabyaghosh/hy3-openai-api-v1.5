@@ -35,24 +35,44 @@ jobs:
 
       - name: Check for unreferenced constants
         # Catches the SSE_BUFFER_CAP-class bug (constant defined, never used).
+        #
+        # IMPORTANT: `used` MUST be restricted to ast.Load contexts. An assignment
+        # target is itself an ast.Name node, so an unfiltered `used` set always
+        # contains every name in `defined` — making `defined - used` permanently
+        # empty and the whole check a silent no-op.
         run: |
-          python -c "
+          python - <<'PY'
           import ast, sys
-          with open('server.py') as f:
-              tree = ast.parse(f.read())
-          defined = {n.id for node in ast.walk(tree) if isinstance(node, ast.Assign)
-                     for n in node.targets if isinstance(n, ast.Name)}
-          used = {n.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-          # Constants that are intentionally config-only (exported via / endpoint)
-          config_exported = {'MAX_CONCURRENT','QUEUE_TIMEOUT','MAX_MESSAGES','MAX_CONTENT_CHARS'}
-          unused = defined - used - config_exported
-          # Filter out dunder/module-level conventions
-          unused = {c for c in unused if not c.startswith('_') and c.isupper()}
-          if unused:
-              print(f'WARNING: possibly unused constants: {sorted(unused)}', file=sys.stderr)
-          else:
-              print('No unused constants detected')
-          "
+
+          def unused_constants(path):
+              with open(path) as f:
+                  tree = ast.parse(f.read())
+              defined = {
+                  n.id
+                  for node in ast.walk(tree)
+                  if isinstance(node, ast.Assign)
+                  for n in node.targets
+                  if isinstance(n, ast.Name)
+              }
+              # Only Load contexts count as a real reference.
+              used = {
+                  n.id
+                  for n in ast.walk(tree)
+                  if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+              }
+              unused = defined - used
+              # Only care about module-level SCREAMING_SNAKE constants.
+              return {c for c in unused if not c.startswith('_') and c.isupper()}
+
+          for path in ('server.py', 'logging_layer.py'):
+              leftover = unused_constants(path)
+              if leftover:
+                  print(f'WARNING: {path}: possibly unused constants: {sorted(leftover)}', file=sys.stderr)
+              else:
+                  print(f'{path}: no unused constants detected')
+          # Warn only — do not fail the build on a heuristic.
+          sys.exit(0)
+          PY
 
       - name: Bash syntax check
         run: bash -n hy3.sh && echo "hy3.sh: OK"

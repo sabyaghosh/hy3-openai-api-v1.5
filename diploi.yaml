@@ -1,0 +1,45 @@
+# This file is used to build the infrastructure for a deployment.
+# After editing something here, apply the changes on the Diploi dashboard.
+# For more information, see https://diploi.com/yaml
+
+diploiVersion: v1.0
+components:
+  - hosts:
+      - port: 8000
+        endpoint: true
+        name: App
+        identifier: app
+    name: FastAPI
+    identifier: fastapi
+    folder: /
+    package: https://github.com/diploi/component-fastapi#v0.136.1
+    containerCommands:
+      productionStart: >-
+        uv run --with uvicorn uvicorn server:app --host 0.0.0.0 --port 8000
+        --proxy-headers --forwarded-allow-ips='*'
+      developmentStart: >-
+        uv run --with uvicorn uvicorn server:app --host 0.0.0.0 --port 8000
+        --reload
+    env:
+      include:
+        - value: '3.11'
+          name: PYTHON_VERSION
+        - value: 0.0.0.0
+          name: HOST
+        - value: '8000'
+          name: PORT
+        - value: '1'
+          name: PYTHONUNBUFFERED
+        - value: https://tencent-Hy3.hf.space/gradio_api/call/chat
+          name: HY3_BASE
+        - value: '90'
+          name: HTTP_READ_TIMEOUT
+        - value: 'true'
+          name: PRESERVED_THINKING
+        - value: '10'
+          name: MAX_CONCURRENT
+        - value: '5'
+          name: QUEUE_TIMEOUT
+        - value: 'true'
+          name: TRUST_PROXY_HEADERS
+addons: []

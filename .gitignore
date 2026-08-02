@@ -12,6 +12,12 @@ __pycache__/
 venv/
 env/
 
+# uv toolchain artifacts.
+# Dockerfile.dev sets UV_PYTHON_INSTALL_DIR=$FOLDER/.python, so uv downloads a
+# full CPython tree (~hundreds of MB) into ./.python inside the repo. Never commit it.
+.python/
+.uv-cache/
+
 # Local Hy3 state
 .hy3_state/
 
