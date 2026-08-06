@@ -5,7 +5,282 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] — 2026-08-06
+
+Bug-fix release addressing 24 issues found in a v1.5.0 code review. All changes
+are backward-compatible — no breaking API changes. Existing API consumers
+(Kilocode, Opencode, OpenAI Python SDK, etc.) continue to work without
+modification.
+
+### 🔴 Critical (API contract violations)
+
+- **#5: `/v1/responses` now rejects `stream=true` with 422.** The endpoint
+  accepted `stream` and its docstring advertised Responses API stream events
+  (`response.created`, `response.output_text.delta`, `response.completed`),
+  but the implementation always collected the full response and returned a
+  single JSON object. Clients requesting streaming would hang waiting for
+  events that never arrive. Now returns a clear 422 validation error pointing
+  to `/v1/chat/completions` for streaming.
+- **#7: `_content_to_str()` no longer crashes on non-string `text` values.**
+  The function assumed `text` was always a string, but the OpenAI spec allows
+  any JSON value. A part like `{"type": "text", "text": 123}` or `{"type":
+  "text", "text": null}` would raise `TypeError` in `"\n".join(parts)`,
+  turning a malformed-client 400 into a 500. Now coerces non-string values
+  (None → "", numbers/bools → stringified).
+- **#9: Upstream returning no usable chunks now returns 502.** If the Hy3
+  upstream stream closed prematurely, contained only malformed SSE events,
+  or emitted an error in another SSE field, the server would return HTTP 200
+  with empty content. Now tracks whether at least one valid snapshot was
+  received (in both streaming and non-streaming paths) and returns 502 with
+  a clear "upstream returned no usable snapshot" error if not.
+- **#11: `/v1/responses` now implements `tool_choice`.** The field was
+  accepted and copied into an unused `ChatCompletionRequest`, but the actual
+  payload never applied the tool-choice prompt prefix or stripped tools for
+  `tool_choice="none"`. Now reuses the same WP4 helpers as
+  `/v1/chat/completions`.
+- **#12: `/v1/responses` function-call IDs are now consistent.** `id` and
+  `call_id` were each calling `uuid.uuid4()` separately, producing different
+  values. Clients use `call_id` to associate tool results with the
+  originating function call — different values broke that correlation. Now
+  generates the ID once and reuses it for both fields.
+- **#13: `/v1/responses` no longer discards text when tool calls are present.**
+  The endpoint used an `if/else` that emitted either function-call items OR
+  a text message, never both. If the model returned explanatory text AND
+  tool calls, the text was silently dropped. Now emits both in the `output`
+  array (reasoning + function_calls + text message), matching the Responses
+  API spec.
+- **#14: Removed false `response_format` validation/retry claims.** The
+  implementation only injects prompt instructions — there was no
+  `json.loads()` validation, no JSON Schema validation, and no retry.
+  Comments and the v1.5.0 CHANGELOG explicitly claimed "post-stream JSON
+  validation retries once," which was false. Now documented honestly as
+  best-effort JSON prompting. True structured-output enforcement requires
+  upstream Hy3 support, which does not exist.
+
+### 🟠 High (correctness & observability)
+
+- **#17: Streaming tool-argument divergence is now detected.** Arguments
+  were assumed to grow monotonically. If a later cumulative snapshot shrank
+  the args or changed already-emitted characters (regeneration, retry), the
+  server silently kept stale data. Now detects shrinkage and emits a stream
+  error event (`upstream_tool_args_diverged`) so the client knows to retry.
+- **#18: Text divergence no longer emits duplicate content.** When a new
+  snapshot did not start with the previous one, the previous behavior was to
+  reset `last_resp_len=0` and re-emit the new snapshot from the start —
+  but clients cannot retract already-emitted text, so this produced
+  concatenated/duplicated output. Now emits a stream error event
+  (`upstream_snapshot_diverged`) instead.
+- **#19: Non-streaming cancellation now finalizes request records.**
+  `asyncio.CancelledError` derives from `BaseException`, not `Exception`,
+  so the surrounding `except Exception` clause didn't catch it. Disconnected
+  non-streaming requests vanished from `/admin/requests`. Now explicitly
+  catches `CancelledError`, stamps status 499 (nginx convention), and
+  finalizes the record.
+- **#20: `messages_to_hy3()` now actually finds the last user message.**
+  When the final message was `assistant`, the previous behavior made the
+  assistant's text the new top-level prompt (`tail or "Continue."`), which
+  conflicted with the v1.4.0 changelog claim that the code "correctly finds
+  the last user message." Now scans backwards to find the latest user
+  message and uses it as the prompt. Messages after it (assistant turn,
+  tool result) become part of history.
+- **#23: Split `/health` (liveness) from `/ready` (readiness).** The
+  previous `/health` returned 503 when the upstream error rate was high,
+  which is a reasonable readiness signal but a dangerous liveness signal —
+  orchestrators would restart the proxy during an upstream outage,
+  destroying diagnostics and adding recovery churn. Now:
+  - `/health` always returns 200 while the process is alive (pure liveness).
+  - `/ready` returns 503 when the upstream error rate is high (readiness).
+  - `Dockerfile` HEALTHCHECK and `render.yaml` `healthCheckPath` updated to
+    use `/ready`.
+
+### 🟡 Medium (input validation & DoS hardening)
+
+- **#25: `stop` input is now strictly validated.** Previously, non-string
+  list entries, empty strings, and lists longer than 4 entries were silently
+  dropped or truncated. Now returns 422 with a clear validation error
+  message for each case.
+- **#26: `temperature` and `top_p` are now bounded.** `temperature` is
+  limited to `[0, 2]` and `top_p` to `[0, 1]` per the OpenAI spec. Values
+  outside these ranges return 422 instead of being forwarded to upstream
+  Hy3 (which has inconsistent behavior for out-of-range values).
+- **#27: `developer` messages are now treated as system instructions.**
+  The `developer` role was accepted by the Pydantic model but routed to
+  history in `messages_to_hy3()`, even though OpenAI's spec defines
+  `developer` as the newer name for system-prompt-style instructions. Now
+  concatenated into `system_prompt` alongside `system` messages.
+- **#28: Message content limits now include significant request fields.**
+  `MAX_CONTENT_CHARS` previously counted only `message.content`. Now also
+  counts `tool_calls`, `reasoning_content`, `name`, and `tool_call_id` on
+  each message. Closes a DoS gap where a request with tiny messages but a
+  5MB `tools` array would pass the limit (the `tools` array at the request
+  level is still counted separately in the usage estimation).
+- **#29: SSE buffer cap is now measured in bytes.** `len(line)` counts
+  Python Unicode characters, but `SSE_BUFFER_CAP` and its comment both say
+  "bytes." A line of 10M emoji chars is ~40MB in UTF-8 but only 10M in
+  chars — the char-based check would have let it through. Now uses
+  `len(line.encode("utf-8", errors="replace"))`.
+
+### 🟢 Low (dead code & CLI robustness)
+
+- **#35: Removed dead `chat_req` construction in `/v1/responses`.** A
+  `ChatCompletionRequest` was built but never used, providing only
+  incidental secondary validation. Removed; validation is now intentional
+  via `ResponsesRequest`'s own validators.
+- **#36: `hy3.sh` file-based tools are now validated.** The `-f` flag
+  accepted a readable file without parsing its contents. Invalid JSON would
+  then crash `build_payload` with a Python traceback. Now validates with
+  `json.loads` before accepting.
+- **#37: `hy3.sh` corrupt conversation state no longer causes a traceback.**
+  Saved history was read directly and passed to `json.loads` without a
+  user-friendly validation path. A partially written or manually damaged
+  state file terminated the CLI with a Python traceback. Now validates and
+  prints a clear error with instructions to delete the file.
+- **#38: `hy3.sh` SSE shape check is now complete.** The check verified
+  `data[0]` is a list but not that it contains an element. A payload shaped
+  as `[[]]` would pass the check, then crash on `data[0][0]` with
+  `IndexError` — outside the try/except block. Now verifies
+  `len(data[0]) >= 1` and safely coerces `None`/non-string values.
+- **#39: `hy3.sh` tool-call parsing no longer assumes every item is a dict.**
+  `tc.get(...)` was called without verifying `tc` is a dict. Malformed
+  upstream tool-call data (e.g. a bare string) would crash the CLI with
+  `AttributeError` after an otherwise successful generation. Now checks
+  `isinstance(tc, dict)` and skips malformed entries with a warning.
+- **#40: `hy3.sh` usage errors now exit with status 1.** `usage()` always
+  exited 0, including for invalid options and missing prompt. Automation
+  could not distinguish invalid invocation from success. Now split into
+  `print_usage` (exits 0 for `-h`) and `usage_error` (exits 1 for errors).
+- **#41: `hy3.sh` raw mode no longer silently succeeds with no result.**
+  If SSE data existed but no valid payload was parsed, raw mode emitted
+  nothing and exited 0. Now prints an error to stderr and exits 1.
+
+### ⚙️ Internal
+
+- Version bumped from 1.5.0 to 1.5.1. Single source of truth (`__version__`
+  constant in `server.py`) reflects the new version; `pyproject.toml` is
+  in sync.
+- `Dockerfile` HEALTHCHECK and `render.yaml` `healthCheckPath` updated to
+  use `/ready` instead of `/health`.
+- Root endpoint (`GET /`) now advertises both `/health` and `/ready`.
+
+## [1.5.0] — 2026-08-06
+
+Compatibility release targeting **Kilocode** (kilo.ai) and **Opencode** (opencode.ai).
+Both tools use the Vercel AI SDK `@ai-sdk/openai-compatible` package as their HTTP
+client, which enforces a stricter subset of the OpenAI specification than the
+official Python SDK. This release closes the three critical gaps that prevented
+those tools from using Hy3, plus several secondary spec-coverage improvements.
+
+All changes are additive and backward-compatible — existing API consumers
+(Hermes Agent, Agent Zero, OpenClaw, and any other client built on the official
+OpenAI SDK) continue to work without modification.
+
+### 🔴 Critical
+
+- **WP1: Streaming usage support.** When `stream_options.include_usage` is true,
+  the server now emits a final SSE chunk with the populated `usage` object before
+  `data: [DONE]`. The chunk has an empty `choices` array (present but empty, not
+  omitted) and a fully-populated `usage` object with `prompt_tokens`,
+  `completion_tokens`, and `total_tokens` fields. Required by the Vercel AI SDK
+  `@ai-sdk/openai-compatible` package's `includeUsage` provider setting. Fixes
+  always-zero token usage reported by Kilocode and Opencode
+  ([anomalyco/opencode#423](https://github.com/anomalyco/opencode/issues/423),
+  [vercel/ai#6774](https://github.com/vercel/ai/issues/6774)).
+- **WP2: `/v1/models` metadata enrichment.** Each model entry now includes
+  `context_length`, `max_tokens`, `tool_call`, `reasoning`,
+  `supports_parallel_tool_calls`, and `supports_structured_outputs` fields.
+  Enables auto-compaction in both tools without manual `limit.context`/
+  `limit.output` configuration. Without these fields, Kilocode's documentation
+  explicitly states "compaction is disabled" and "conversations will grow
+  unbounded until the provider rejects the request."
+- **WP3: Tool-call streaming delta conformance.** Tool-call deltas are now
+  emitted incrementally across the SSE stream, with each delta including the
+  `index` field identifying which tool call the delta applies to. The first
+  delta for an index carries `id` + `function.name` + empty `function.arguments`;
+  subsequent deltas for the same index carry `function.arguments` fragments.
+  Matches the OpenAI streaming specification. Fixes null-arguments tool calls
+  in Kilocode and Opencode caused by the v1.4.5 single-end-of-stream delta
+  emission pattern.
+
+### 🟠 High
+
+- **WP4: `stop` sequences.** When `stop` is set (string or array of up to 4
+  strings), the streaming and non-streaming paths both truncate the response at
+  the first occurrence of any stop sequence (excluding the sequence itself from
+  emitted text). Implemented client-side because Hy3 upstream does not natively
+  support stop sequences. `finish_reason` is set to `"stop"`.
+- **WP4: `response_format`.** `json_object` mode prepends an instruction to the
+  system prompt directing the model to produce valid JSON. `json_schema` mode
+  additionally prepends the JSON schema. True constrained decoding is not
+  possible without upstream support; this prompt-prefix approach matches what
+  most OpenAI-compatible proxies do.
+- **WP4: `tool_choice`.** Three modes honored: `"none"` (strips `tools` from
+  upstream payload and prepends a no-tools instruction), `"auto"` (default,
+  no-op), and `{"type": "function", "function": {"name": "..."}}` (prepends a
+  forced-function instruction). `"required"` is also accepted and translated to
+  a prompt-level instruction.
+- **WP4: `parallel_tool_calls`.** When `false`, prepends a prompt instruction
+  limiting the model to a single tool call per response. When `true` or
+  omitted, no action is taken (Hy3's default behavior already allows multiple
+  tool calls).
+
+### 🟡 Medium
+
+- **WP5: `system_fingerprint` field.** Added to all non-streaming and streaming
+  responses. Value is `fp_hy3_<version>` (e.g. `fp_hy3_1.5.0`). Identifies the
+  exact server build that produced a response; clients use it for caching and
+  reproducibility tracking.
+- **WP5: `logprobs: null` in choices.** Added to every `choices` entry in
+  non-streaming responses and to every SSE chunk. Hy3 doesn't support logprobs;
+  the field is always `null`. Strict OpenAI parsers expect the field to be
+  present even when null.
+- **WP5: dual `reasoning` field.** The `reasoning_content` field (OpenAI o1-style,
+  original to Hy3 v1.4.x) is preserved, and a parallel `reasoning` field is now
+  emitted alongside it in streaming deltas and non-streaming messages. The
+  Vercel AI SDK package looks for the `reasoning` field name; emitting both
+  maximizes client compatibility.
+
+### 🟢 Low / Optional
+
+- **WP6: `/v1/responses` endpoint.** Optional minimal OpenAI Responses API
+  endpoint for tools that prefer `@ai-sdk/openai` (the OpenAI official SDK
+  package) over `@ai-sdk/openai-compatible`. Translates the Responses API
+  request shape (`input` instead of `messages`) to the existing Chat Completions
+  internals, then translates the response back to the Responses API shape
+  (`output` array with `message`/`function_call`/`reasoning` items, `usage`
+  with `input_tokens`/`output_tokens`). Both Kilocode and Opencode default to
+  `@ai-sdk/openai-compatible`, so this endpoint is optional.
+
+### 📚 Documentation
+
+- **New `TOOLS.md`** with Kilocode and Opencode setup guides, configuration
+  reference tables, verification checklists, and troubleshooting sections.
+- **New `examples/` directory** with `kilo.json.example` and
+  `opencode.json.example` — ready-to-paste config snippets for both local
+  development and production deployment.
+- **README updated** with a Compatibility section listing the tools Hy3 has
+  been tested with.
+
+### ⚙️ Internal
+
+- Version bumped from 1.4.5 to 1.5.0. Single source of truth (`__version__`
+  constant in `server.py`) reflects the new version; `pyproject.toml` is in
+  sync.
+- New `StreamOptions` and `ResponseFormat` Pydantic models added to support
+  the new request fields.
+- New `make_usage_chunk` helper added alongside the existing `make_chunk` for
+  the WP1 streaming usage chunk.
+- New `_normalize_stop_sequences`, `_truncate_at_stop`,
+  `_build_response_format_prefix`, `_build_tool_choice_prefix`, and
+  `_build_parallel_tools_prefix` helpers added for WP4.
+- The `stream_openai` async generator signature gained four new optional
+  parameters: `stream_options`, `stop_sequences`, `req_messages`, `req_tools`.
+  All default to `None` and are backward-compatible with existing callers.
+- New `HY3_MODELS` module-level constant enumerates the two served models with
+  their full metadata, used by the enriched `/v1/models` endpoint.
+- New `SYSTEM_FINGERPRINT` module-level constant derived from `__version__`.
+
 ## [1.4.5] — 2025-08-03
+
 
 Full line-by-line code review of the repository. Note that `server.py` had been
 bumped to `1.4.4` without any corresponding `1.4.2`/`1.4.3`/`1.4.4` changelog

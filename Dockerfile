@@ -18,7 +18,8 @@ RUN pip install --no-cache-dir --upgrade pip \
 # Copy app code (logging_layer.py is imported by server.py — must be included).
 # Docs are included for reference; they don't affect runtime but are useful
 # when exec-ing into the container.
-COPY --chown=app:app server.py logging_layer.py hy3.sh tools_example.json README.md CHANGELOG.md DEPLOY.md LICENSE ./
+COPY --chown=app:app server.py logging_layer.py hy3.sh tools_example.json README.md CHANGELOG.md TOOLS.md DEPLOY.md LICENSE ./
+COPY --chown=app:app examples ./examples
 RUN chmod +x hy3.sh
 
 USER app
@@ -32,9 +33,13 @@ ENV PORT=8000 \
 
 # Add HEALTHCHECK so standalone Docker runs report health status.
 # render.yaml uses healthCheckPath separately; this is for `docker run` users.
+# v1.5.1 (#23): use /ready (not /health) for the Docker healthcheck. /health
+# is now a pure liveness signal (always 200 while process is alive), while
+# /ready returns 503 during upstream outages — which is what we want the
+# container orchestrator to see for routing decisions.
 # NOTE: HEALTHCHECK CMD does not expand ${PORT} unless wrapped in sh -c.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD sh -c 'python -c "import os,urllib.request,sys; r=urllib.request.urlopen(\"http://localhost:\"+os.environ.get(\"PORT\",\"8000\")+\"/health\",timeout=3); sys.exit(0 if r.status==200 else 1)" || exit 1'
+  CMD sh -c 'python -c "import os,urllib.request,sys; r=urllib.request.urlopen(\"http://localhost:\"+os.environ.get(\"PORT\",\"8000\")+\"/ready\",timeout=3); sys.exit(0 if r.status==200 else 1)" || exit 1'
 
 # --proxy-headers: trust X-Forwarded-For/X-Real-IP from the load balancer so
 # request.client.host reflects the real client IP (not the proxy's).

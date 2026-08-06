@@ -1,0 +1,33 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "model": "hy3local/hy3",
+  "provider": {
+    "hy3local": {
+      "options": {
+        "apiKey": "{env:HY3_API_KEY}",
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "includeUsage": true
+      },
+      "models": {
+        "hy3": {
+          "name": "Hy3",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        },
+        "hy3-think": {
+          "name": "Hy3 Think",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        }
+      }
+    }
+  }
+}

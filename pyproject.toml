@@ -1,7 +1,7 @@
 [project]
 name = "hy3-openai-api"
 # Keep in sync with server.py __version__ and the CHANGELOG.md top entry.
-version = "1.4.5"
+version = "1.5.1"
 description = "OpenAI-compatible API proxy for Tencent Hy3 295B MoE via HuggingFace Gradio API"
 readme = "README.md"
 license = { text = "MIT" }

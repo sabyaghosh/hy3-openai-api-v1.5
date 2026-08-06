@@ -13,8 +13,10 @@ A production-ready OpenAI-compatible API proxy for [Tencent Hy3](https://hugging
 
 - **OpenAI-compatible** — point any OpenAI SDK / LangChain / LlamaIndex client at `/v1`
 - **Streaming + non-streaming** — full SSE support with `text/event-stream`
-- **Thinking mode** — exposes model reasoning via `reasoning_content` (o1-style)
-- **Tool calling** — full OpenAI function-calling format
+- **Streaming usage** — `stream_options.include_usage` emits a final usage chunk before `[DONE]` (required by Vercel AI SDK `@ai-sdk/openai-compatible`)
+- **Thinking mode** — exposes model reasoning via both `reasoning_content` (o1-style) and `reasoning` (AI SDK-style)
+- **Tool calling** — full OpenAI function-calling format with incremental streaming deltas
+- **OpenAI spec coverage** — `stop` sequences, `response_format` (json_object / json_schema), `tool_choice` (none / auto / required / forced), `parallel_tool_calls`, `system_fingerprint`, `logprobs`
 - **Multi-turn conversations** — pass full message history
 - **Concurrency control** — semaphore with queue + 503 + `Retry-After` (prevents upstream overload)
 - **Observability** — structured logging, in-memory ring buffer, admin endpoints, `/stats` dashboard
@@ -22,9 +24,82 @@ A production-ready OpenAI-compatible API proxy for [Tencent Hy3](https://hugging
 - **CLI client** (`hy3.sh`) — quick one-shot prompts from the terminal
 - **Docker-ready** — one-command deploy to Render / Fly.io / Cloud Run / Koyeb / Railway / HF Spaces
 
+### 🤝 Tool Compatibility
+
+Hy3 v1.5.0+ is tested and known to work with:
+
+| Tool | Status | Setup guide |
+|---|---|---|
+| **Kilocode** (kilo.ai) | ✅ v1.5.0+ | [`TOOLS.md`](TOOLS.md) · [`examples/kilo.json.example`](examples/kilo.json.example) |
+| **Opencode** (opencode.ai) | ✅ v1.5.0+ | [`TOOLS.md`](TOOLS.md) · [`examples/opencode.json.example`](examples/opencode.json.example) |
+| **Hermes Agent** | ✅ all versions | Official OpenAI SDK — works out of the box |
+| **Agent Zero** | ✅ all versions | Official OpenAI SDK — works out of the box |
+| **OpenClaw** | ✅ all versions | Official OpenAI SDK — works out of the box |
+| OpenAI Python SDK | ✅ all versions | Drop-in replacement for `https://api.openai.com/v1` |
+| LangChain | ✅ all versions | Use `ChatOpenAI(base_url="http://<host>:<port>/v1", api_key="anything")` |
+| LlamaIndex | ✅ all versions | Use `OpenAI(api_base="http://<host>:<port>/v1", api_key="anything")` |
+
+For setup walkthroughs, configuration references, and troubleshooting, see [`TOOLS.md`](TOOLS.md).
+
 ---
 
 ## 📦 What's New
+
+### v1.5.1 (Bug-Fix Release)
+
+Addresses 24 issues found in a v1.5.0 code review. All changes are backward-compatible — no breaking API changes. Existing API consumers (Kilocode, Opencode, OpenAI Python SDK, etc.) continue to work without modification.
+
+**Critical fixes (API contract violations):**
+
+- **#5**: `/v1/responses` now rejects `stream=true` with 422 (was silently ignored, leaving clients waiting for events that never arrive)
+- **#7**: `_content_to_str()` no longer crashes on non-string `text` values (was 500 instead of 422)
+- **#9**: Upstream returning no usable chunks now returns 502 (was misleading 200 with empty content)
+- **#11**: `/v1/responses` now implements `tool_choice` (was accepted but unused)
+- **#12**: `/v1/responses` function-call `id` and `call_id` are now consistent (were different UUIDs, breaking tool-result correlation)
+- **#13**: `/v1/responses` no longer discards text when tool calls are present (now emits both)
+- **#14**: Removed false `response_format` validation/retry claims (was best-effort prompting only, no validation)
+
+**High-severity fixes (correctness & observability):**
+
+- **#17**: Streaming tool-argument divergence now detected and emits stream error (was silently stale)
+- **#18**: Text divergence emits stream error instead of duplicating content
+- **#19**: Non-streaming cancellation now finalizes request records (was vanishing from `/admin/requests`)
+- **#20**: `messages_to_hy3()` now actually finds the last user message (was using assistant text as prompt)
+- **#23**: Split `/health` (liveness, always 200) from `/ready` (readiness, 503 on upstream issues); updated Dockerfile + render.yaml
+
+**Medium-severity fixes (input validation & DoS hardening):**
+
+- **#25**: `stop` input strictly validated (422 on bad input, not silent repair)
+- **#26**: `temperature` bounded to `[0, 2]`, `top_p` bounded to `[0, 1]`
+- **#27**: `developer` messages now treated as system instructions (was routed to history)
+- **#28**: Message content limits now include `tool_calls`, `reasoning_content`, `name`, `tool_call_id`
+- **#29**: SSE buffer cap now measured in bytes (was chars — Unicode-heavy lines could bypass)
+
+**Low-severity fixes (dead code & CLI robustness):**
+
+- **#35**: Removed dead `chat_req` construction in `/v1/responses`
+- **#36–41**: `hy3.sh` CLI fixes — file-based tools validation, corrupt history handling, SSE shape check, tool-call dict verification, usage error exit codes, raw mode empty-result error
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list with detailed explanations.
+
+### v1.5.0 (Kilocode + Opencode Compatibility Release)
+
+This release closes the three critical gaps that prevented **Kilocode** (kilo.ai) and **Opencode** (opencode.ai) from using Hy3 as a backend. Both tools build on the Vercel AI SDK [`@ai-sdk/openai-compatible`](https://ai-sdk.dev/providers/openai-compatible-providers) package, which enforces a stricter subset of the OpenAI specification than the official Python SDK.
+
+**Critical fixes:**
+
+- **WP1 — Streaming usage support.** When `stream_options.include_usage` is true, the server now emits a final SSE chunk with the populated `usage` object before `data: [DONE]`. Fixes always-zero token usage reported by both tools.
+- **WP2 — `/v1/models` metadata enrichment.** Each model entry now includes `context_length`, `max_tokens`, `tool_call`, `reasoning`, `supports_parallel_tool_calls`, and `supports_structured_outputs` fields. Enables auto-compaction in both tools without manual `limit.context`/`limit.output` configuration.
+- **WP3 — Tool-call streaming delta conformance.** Tool-call deltas are now emitted incrementally with the `index` field on each delta, matching the OpenAI streaming spec. Fixes null-arguments tool calls in both tools.
+
+**High-severity additions:**
+
+- **WP4 — OpenAI spec coverage.** `stop` sequences (client-side truncation), `response_format` (`json_object` / `json_schema`), `tool_choice` (`none` / `auto` / `required` / forced function), and `parallel_tool_calls` (prompt-level enforcement when `false`).
+- **WP5 — Polish fields.** `system_fingerprint`, `logprobs: null` in choices, dual `reasoning` / `reasoning_content` field emission for AI SDK compatibility.
+- **WP6 — `/v1/responses` endpoint (optional).** Minimal OpenAI Responses API adapter for tools that prefer `@ai-sdk/openai` over `@ai-sdk/openai-compatible`.
+- **WP7 — Tool config snippets + `TOOLS.md`.** New `examples/kilo.json.example` and `examples/opencode.json.example` plus a full setup guide in [`TOOLS.md`](TOOLS.md).
+
+All changes are additive and backward-compatible — existing API consumers (Hermes Agent, Agent Zero, OpenClaw, etc.) continue to work without modification. See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
 ### v1.4.5 (Code-Review Release)
 
@@ -448,7 +523,11 @@ hy3-openai-api/
 ├── Dockerfile             # Docker image (python:3.11.9-slim-bookworm)
 ├── render.yaml            # Render Blueprint for one-click deploy
 ├── requirements.txt       # Pinned Python dependencies
+├── examples/              # Tool config snippets (Kilocode, Opencode)
+│   ├── kilo.json.example
+│   └── opencode.json.example
 ├── DEPLOY.md              # Platform-specific deployment guides
+├── TOOLS.md               # AI tool compatibility guide (Kilocode, Opencode, etc.)
 ├── CHANGELOG.md           # Version history
 ├── LICENSE                # MIT
 └── README.md              # This file

@@ -11,7 +11,11 @@ services:
     plan: free
     region: oregon  # change to your nearest region (e.g. frankfurt, singapore, ohio)
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /health
+    # v1.5.1 (#23): use /ready (not /health) for the Render health check.
+    # /health is now a pure liveness signal (always 200 while process is alive);
+    # /ready returns 503 during upstream outages so Render can route traffic
+    # away from this instance without restarting it.
+    healthCheckPath: /ready
     autoDeploy: true
     envVars:
       - key: HOST
