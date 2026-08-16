@@ -90,7 +90,7 @@ DEFAULT_THINK_LEVEL = "no_think"
 # metadata (visible at /docs, /openapi.json) and the / endpoint.
 # Keep in sync with: pyproject.toml [project].version and the CHANGELOG.md
 # top entry.
-__version__ = "1.5.1"
+__version__ = "1.5.4"
 
 # WP5: System fingerprint identifies the exact server build that produced a
 # response. Basing it on the Hy3 proxy version is sufficient — the upstream
