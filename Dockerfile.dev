@@ -17,4 +17,10 @@ ENV PATH="$FOLDER/.venv/bin:$PATH"
 
 USER 1000:1000
 
-CMD ["uv", "run", "--with", "uvicorn", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "src"]
+# v1.5.5 (B9): fixed the entrypoint — was `src.main:app` which doesn't exist
+# in this repo (the actual entry is `server:app`, matching Dockerfile and
+# diploi.yaml). Also fixed `--reload-dir` from `src` (non-existent) to `.`
+# (the repo root, where server.py + logging_layer.py live). The previous
+# Dockerfile.dev was a leftover from Diploi's component-fastapi template and
+# would fail with ModuleNotFoundError on startup.
+CMD ["uv", "run", "--with", "uvicorn", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "."]

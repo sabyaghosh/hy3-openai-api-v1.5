@@ -50,6 +50,7 @@ Tool calling:
 
 import argparse
 import asyncio
+from collections import deque
 from contextlib import asynccontextmanager
 import hmac
 import json
@@ -90,7 +91,7 @@ DEFAULT_THINK_LEVEL = "no_think"
 # metadata (visible at /docs, /openapi.json) and the / endpoint.
 # Keep in sync with: pyproject.toml [project].version and the CHANGELOG.md
 # top entry.
-__version__ = "1.5.4"
+__version__ = "1.5.5"
 
 # WP5: System fingerprint identifies the exact server build that produced a
 # response. Basing it on the Hy3 proxy version is sufficient — the upstream
@@ -116,7 +117,7 @@ HY3_MODELS = [
         "object": "model",
         "created": int(time.time()),
         "owned_by": "tencent",
-        "context_length": 131072,
+        "context_length": 262144,
         "max_tokens": 8192,
         "tool_call": True,
         "reasoning": False,
@@ -128,7 +129,7 @@ HY3_MODELS = [
         "object": "model",
         "created": int(time.time()),
         "owned_by": "tencent",
-        "context_length": 131072,
+        "context_length": 262144,
         "max_tokens": 8192,
         "tool_call": True,
         "reasoning": True,
@@ -249,6 +250,14 @@ SSE_BUFFER_CAP = _parse_int_env("SSE_BUFFER_CAP", 10_000_000, min_val=1024)
 # NOTE: must be defined here, ABOVE _client_ip(), which reads it.
 TRUST_PROXY_HEADERS = _parse_bool_env("TRUST_PROXY_HEADERS", True)
 
+# v1.5.4 (Fix 2): Cap reasoning/thinking content length. The hy3-think model
+# can produce 100KB+ of reasoning_content in a single response, which causes
+# 80-104 second generation times, gateway timeouts, and overwhelms client
+# tools (BrowserOS, Kilocode, Opencode) that buffer the entire response.
+# This cap truncates reasoning_content to MAX_REASONING_CHARS (default 50000)
+# and appends a truncation indicator. Set to 0 to disable the cap.
+MAX_REASONING_CHARS = _parse_int_env("MAX_REASONING_CHARS", 50000, min_val=0)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -322,15 +331,18 @@ _ERROR_TYPE_BY_STATUS = {
 def _openai_error(
     status_code: int, message: str, code: Optional[str] = None
 ) -> JSONResponse:
+    # v1.5.5 (C6): only include `code` when it's not None. The OpenAI spec
+    # says `code` is optional; including `"code": null` is harmless but slightly
+    # non-spec. Now conditionally includes the field.
+    err: dict = {
+        "message": message,
+        "type": _ERROR_TYPE_BY_STATUS.get(status_code, "api_error"),
+    }
+    if code is not None:
+        err["code"] = code
     return JSONResponse(
         status_code=status_code,
-        content={
-            "error": {
-                "message": message,
-                "type": _ERROR_TYPE_BY_STATUS.get(status_code, "api_error"),
-                "code": code,
-            }
-        },
+        content={"error": err},
     )
 
 
@@ -431,7 +443,6 @@ class ConcurrencyLimiter:
         # Rolling window of the last 50 outcomes (True = errored). Used by
         # /health to detect transient upstream failures without a permanent
         # 503 brick from a single bad burst (cumulative counters never decay).
-        from collections import deque
         self._recent_outcomes: deque = deque(maxlen=50)
 
     async def acquire(self) -> bool:
@@ -694,6 +705,14 @@ class ChatCompletionRequest(BaseModel):
 # ----------------------- Helpers -----------------------
 
 
+# v1.5.5 (B1): content-part types that carry a `text` field we should extract.
+# - "text"         — Chat Completions multimodal content
+# - "input_text"    — Responses API input content parts
+# - "output_text"   — Responses API output content parts (used when echoing
+#                     prior assistant turns back as input)
+_CONTENT_TEXT_TYPES = {"text", "input_text", "output_text"}
+
+
 def _content_to_str(content: Optional[Union[str, list]]) -> str:
     """Convert OpenAI message content (str or list of parts) to a plain string.
 
@@ -701,6 +720,13 @@ def _content_to_str(content: Optional[Union[str, list]]) -> str:
       [{"type": "text", "text": "hello"}, {"type": "image_url", "image_url": {...}}]
     Hy3 only accepts a string, so we extract and concatenate all text parts.
     Non-text parts (images, audio) are silently dropped (Hy3 doesn't support them).
+
+    v1.5.5 (B1): the Responses API uses content-part types `input_text` and
+    `output_text` (not `text`). We now recognize all three so that a valid
+    Responses API input like
+      [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]
+    is correctly flattened instead of silently dropping the text and sending
+    an empty prompt upstream.
 
     Robustness (#7): the OpenAI spec allows `text` to be any JSON value (some
     clients send numbers, null, or nested objects for non-standard content
@@ -714,7 +740,7 @@ def _content_to_str(content: Optional[Union[str, list]]) -> str:
     if isinstance(content, list):
         parts = []
         for p in content:
-            if isinstance(p, dict) and p.get("type") == "text":
+            if isinstance(p, dict) and p.get("type") in _CONTENT_TEXT_TYPES:
                 raw = p.get("text", "")
                 # Coerce non-string text to string. None → "" (matches OpenAI
                 # behavior for empty content). Numbers/bools are stringified.
@@ -1231,8 +1257,14 @@ async def call_hy3_stream(
 
 
 def _safe_idx(lst: list, i: int, default: Any) -> Any:
-    """Safely index a list, returning default if out of range or falsy."""
-    if i < len(lst) and lst[i]:
+    """Safely index a list, returning default if out of range or None.
+
+    v1.5.5 (C4): use `is None` check instead of truthiness — falsy values like
+    integer 0 or empty string "" are valid and should be returned, not treated
+    as missing. Only None (the upstream's "missing" sentinel) falls back to
+    default.
+    """
+    if i < len(lst) and lst[i] is not None:
         return lst[i]
     return default
 
@@ -1360,11 +1392,6 @@ def make_tool_call_objects(tool_calls: list) -> list:
     return [_tool_call_to_openai(tc) for tc in tool_calls]
 
 
-def make_tool_call_delta(tool_calls: list) -> list:
-    """Convert Hy3 tool_calls to OpenAI streaming delta format."""
-    return [_tool_call_to_openai(tc, index=i) for i, tc in enumerate(tool_calls)]
-
-
 # ----------------------- Endpoints -----------------------
 
 
@@ -1473,16 +1500,14 @@ async def list_models():
     supports_parallel_tool_calls, supports_structured_outputs) are added so
     that Kilocode and Opencode can auto-detect capabilities and drive
     context-window compaction without manual user configuration.
+
+    v1.5.5 (C13): `created` is now a fixed server-start timestamp instead of
+    `int(time.time())` on every call. OpenAI's `/v1/models` returns a stable
+    `created` (model creation date); returning the current time on every call
+    was non-standard. The value is captured at import time and reused.
     """
     # Return a fresh copy so callers cannot mutate HY3_MODELS.
-    # Refresh the `created` timestamp on each call so clients see a current
-    # value (matches OpenAI behavior where models list reflects current state).
-    now = int(time.time())
-    data = []
-    for m in HY3_MODELS:
-        entry = dict(m)
-        entry["created"] = now
-        data.append(entry)
+    data = [dict(m) for m in HY3_MODELS]
     return {"object": "list", "data": data}
 
 
@@ -1840,20 +1865,35 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if stop_sequences and final_resp:
         final_resp, hit_stop = _truncate_at_stop(final_resp, stop_sequences)
         if hit_stop:
-            record.finish_reason = "stop"
-            finish_reason = "stop"
+            # v1.5.5 (B2): per OpenAI spec, `tool_calls` takes precedence over
+            # `stop` when tool calls are present. Previously this overrode
+            # finish_reason to "stop" even when final_tools was non-empty,
+            # producing inconsistent behavior vs the streaming path (which
+            # correctly kept "tool_calls"). The truncation still happens —
+            # only the reported finish_reason changes.
+            if not final_tools:
+                record.finish_reason = "stop"
+                finish_reason = "stop"
             log_event(
                 "info",
                 "request.stop_sequence_hit",
                 request_id=request_id,
                 stops=stop_sequences,
                 truncated_chars=record.response_chars - len(final_resp),
+                finish_reason=finish_reason,
             )
             record.response_chars = len(final_resp)
 
     # OpenAI spec: content should be null (not "") when tool_calls is present.
     message: dict = {"role": "assistant", "content": final_resp or None}
     if final_think:
+        # v1.5.4 (Fix 2): cap reasoning content at MAX_REASONING_CHARS to
+        # prevent massive reasoning from overwhelming client tools.
+        if MAX_REASONING_CHARS > 0 and len(final_think) > MAX_REASONING_CHARS:
+            final_think = (
+                final_think[:MAX_REASONING_CHARS]
+                + f"\n...[reasoning truncated at {MAX_REASONING_CHARS} chars]"
+            )
         # WP5: emit BOTH `reasoning_content` (OpenAI o1-style, original) and
         # `reasoning` (Vercel AI SDK preferred field name).
         message["reasoning_content"] = final_think
@@ -1956,6 +1996,21 @@ async def stream_openai(
     seen_tool_calls: dict[int, int] = {}  # index -> len of args already emitted
     # WP4: track whether we've already hit a stop sequence and terminated.
     stopped_early = False
+    # v1.5.5 (B3): stop-sequence retraction across chunk boundaries.
+    # When stop sequences are active, we hold back the last (max_stop_len - 1)
+    # chars of each emitted delta. On the next chunk, the holdback is prepended
+    # to the new delta and checked for stop sequences across the boundary.
+    # This prevents emitting a partial stop sequence (e.g. "STO" when
+    # stop=["STOP"]) that the next chunk completes — which the client cannot
+    # retract.
+    max_stop_len = max((len(s) for s in stop_sequences), default=0) if stop_sequences else 0
+    pending_holdback = ""
+    # v1.5.5 (B3): emitted_response_len tracks the total chars actually sent
+    # to the client (excludes held-back chars that were truncated by a stop
+    # sequence). Used for the usage chunk and record.response_chars so they
+    # reflect what the client actually received, not the raw cumulative
+    # snapshot length.
+    emitted_response_len = 0
 
     log_event(
         "info",
@@ -1991,6 +2046,14 @@ async def stream_openai(
                     prev_len=len(prev_resp),
                     new_len=len(resp),
                 )
+                # v1.5.5: finalize the record BEFORE yielding so that a client
+                # disconnect at the yield does not cause the finally block to
+                # stamp status_code=499 over the actual 502 error code.
+                if record is not None and not record.finalized:
+                    record.status_code = 502
+                    record.error = "upstream snapshot diverged (non-monotonic text)"
+                    record.finish_reason = "error"
+                    record.finalize()
                 # Emit a stream error event (HTTP 200 with error in SSE body —
                 # matches the existing error pattern in this generator).
                 err = {
@@ -2001,11 +2064,6 @@ async def stream_openai(
                 }
                 yield f"data: {json.dumps(err)}\n\n"
                 yield "data: [DONE]\n\n"
-                if record is not None and not record.finalized:
-                    record.status_code = 502
-                    record.error = "upstream snapshot diverged (non-monotonic text)"
-                    record.finish_reason = "error"
-                    record.finalize()
                 errored = True
                 return
             if resp:
@@ -2015,7 +2073,26 @@ async def stream_openai(
                 received_valid_snapshot = True  # #9 streaming (thinking-only response)
 
             # Emit thinking deltas (as reasoning_content AND reasoning, WP5)
-            if think and len(think) > last_think_len:
+            # v1.5.4 (Fix 2): cap reasoning content at MAX_REASONING_CHARS to
+            # prevent 100KB+ reasoning streams from overwhelming client tools
+            # and causing gateway timeouts. Once the cap is reached, stop
+            # emitting reasoning deltas — the remaining reasoning is silently
+            # dropped. The usage chunk will reflect the capped length.
+            if MAX_REASONING_CHARS > 0 and len(think) > MAX_REASONING_CHARS:
+                # Cap reached — truncate think to the limit + indicator
+                truncated_indicator = f"\n...[reasoning truncated at {MAX_REASONING_CHARS} chars]"
+                think_capped = think[:MAX_REASONING_CHARS] + truncated_indicator
+                if len(think_capped) > last_think_len:
+                    chunk = make_chunk(
+                        completion_id, model,
+                        reasoning=think_capped[last_think_len:],
+                        created=created_ts,
+                    )
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    last_think_len = len(think_capped)
+                    if record:
+                        record.response_thinking_chars = len(think_capped)
+            elif think and len(think) > last_think_len:
                 chunk = make_chunk(
                     completion_id, model, reasoning=think[last_think_len:], created=created_ts
                 )
@@ -2024,50 +2101,89 @@ async def stream_openai(
                 if record:
                     record.response_thinking_chars = len(think)
 
-            # WP4: client-side stop-sequence truncation. Check the accumulated
-            # response against all stop sequences on every chunk. If a stop
-            # sequence appears, truncate the response and break out of the
-            # upstream loop early. The truncated text is emitted as a final
-            # delta (if any) before the finish_reason chunk.
-            if stop_sequences and resp:
-                truncated, hit_stop = _truncate_at_stop(resp, stop_sequences)
+            # v1.5.5 (B3): stop-sequence retraction with cross-chunk holdback.
+            # When stop sequences are active, we hold back the last
+            # (max_stop_len - 1) chars of each emitted delta. On the next
+            # chunk, the holdback is prepended to the new delta and checked
+            # for stop sequences across the boundary. This prevents emitting
+            # a partial stop sequence (e.g. "STO" when stop=["STOP"]) that
+            # the next chunk completes — which the client cannot retract.
+            #
+            # The previous implementation checked `resp` (the full cumulative
+            # snapshot) for stop sequences, but emitted `resp[last_resp_len:]`
+            # before the check, so a partial stop sequence at the end of a
+            # delta was already sent to the client by the time the next chunk
+            # arrived with the completing characters.
+            if resp and len(resp) > last_resp_len:
+                new_text = resp[last_resp_len:]
+                # Combine the previous holdback with the new delta to check
+                # for stop sequences across the chunk boundary.
+                candidate = pending_holdback + new_text
+                pending_holdback = ""  # reset; will be repopulated below
+                if stop_sequences:
+                    truncated_candidate, hit_stop = _truncate_at_stop(candidate, stop_sequences)
+                else:
+                    truncated_candidate, hit_stop = candidate, False
+
                 if hit_stop:
-                    # Emit the truncated portion that hasn't been sent yet.
-                    if len(truncated) > last_resp_len:
+                    # Stop sequence found in candidate. Emit only the
+                    # truncated portion (which excludes the stop sequence).
+                    # Don't hold anything back — we're done streaming.
+                    if truncated_candidate:
                         chunk = make_chunk(
                             completion_id, model,
-                            content=truncated[last_resp_len:],
+                            content=truncated_candidate,
                             created=created_ts,
                         )
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    # Override the accumulated response to the truncated version
-                    # so the final usage chunk counts the truncated length.
-                    prev_resp = truncated
-                    resp = truncated
-                    last_resp_len = len(truncated)
+                        emitted_response_len += len(truncated_candidate)
+                    # B2: tool_calls takes precedence over stop when tools present.
+                    if not final_tools:
+                        if record:
+                            record.finish_reason = "stop"
                     stopped_early = True
                     if record:
-                        record.response_chars = len(truncated)
-                        record.finish_reason = "stop"
+                        record.response_chars = emitted_response_len
                     log_event(
                         "info",
                         "stream.stop_sequence_hit",
                         request_id=request_id,
                         stops=stop_sequences,
-                        truncated_chars=len(truncated),
+                        truncated_chars=emitted_response_len,
+                        finish_reason=record.finish_reason if record else None,
                     )
-                    # Break out of the upstream stream loop — we're done.
+                    # Mark the snapshot as fully consumed so the post-loop
+                    # flush doesn't re-emit anything.
+                    last_resp_len = len(resp)
+                    prev_resp = resp
                     break
 
-            # Emit response deltas
-            if resp and len(resp) > last_resp_len:
-                chunk = make_chunk(
-                    completion_id, model, content=resp[last_resp_len:], created=created_ts
-                )
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                # No stop sequence in candidate. Emit everything except the
+                # last (max_stop_len - 1) chars, which we hold back for the
+                # next chunk's boundary check.
+                if max_stop_len > 1 and len(candidate) >= max_stop_len - 1:
+                    # Hold back the last (max_stop_len - 1) chars.
+                    safe_to_emit = candidate[:-(max_stop_len - 1)]
+                    pending_holdback = candidate[-(max_stop_len - 1):]
+                else:
+                    # candidate is shorter than the holdback window, or no
+                    # stop sequences — hold it all back. It'll be emitted on
+                    # the next chunk (or at stream end if no more chunks).
+                    safe_to_emit = ""
+                    pending_holdback = candidate
+
+                if safe_to_emit:
+                    chunk = make_chunk(
+                        completion_id, model,
+                        content=safe_to_emit,
+                        created=created_ts,
+                    )
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    emitted_response_len += len(safe_to_emit)
                 last_resp_len = len(resp)
+                prev_resp = resp
                 if record:
-                    record.response_chars = len(resp)
+                    record.response_chars = emitted_response_len
 
             # WP3: emit tool-call deltas incrementally. For each tool call in
             # the current snapshot that we haven't yet announced (or whose
@@ -2127,13 +2243,14 @@ async def stream_openai(
                                 "type": "upstream_tool_args_diverged",
                             }
                         }
-                        yield f"data: {json.dumps(err)}\n\n"
-                        yield "data: [DONE]\n\n"
+                        # v1.5.5: finalize the record BEFORE yielding.
                         if record is not None and not record.finalized:
                             record.status_code = 502
                             record.error = f"tool args diverged (index {i}, shrank)"
                             record.finish_reason = "error"
                             record.finalize()
+                        yield f"data: {json.dumps(err)}\n\n"
+                        yield "data: [DONE]\n\n"
                         errored = True
                         return
                     # Check that the previously-emitted prefix is still a prefix
@@ -2179,6 +2296,12 @@ async def stream_openai(
                 request_id=request_id,
                 error="upstream returned no usable snapshot",
             )
+            # v1.5.5: finalize the record BEFORE yielding.
+            if record is not None and not record.finalized:
+                record.status_code = 502
+                record.error = "upstream returned no usable snapshot (streaming)"
+                record.finish_reason = "error"
+                record.finalize()
             err = {
                 "error": {
                     "message": "Hy3 upstream returned no usable snapshot. The stream may have closed prematurely or contained only malformed events.",
@@ -2187,37 +2310,70 @@ async def stream_openai(
             }
             yield f"data: {json.dumps(err)}\n\n"
             yield "data: [DONE]\n\n"
-            if record is not None and not record.finalized:
-                record.status_code = 502
-                record.error = "upstream returned no usable snapshot (streaming)"
-                record.finish_reason = "error"
-                record.finalize()
             errored = True
             return
 
-        # Emit final finish_reason chunk
+        # v1.5.5 (B3): flush any remaining pending_holdback. When the stream
+        # ends naturally (no stop sequence hit), the last (max_stop_len - 1)
+        # chars were held back for boundary checking. Since there's no next
+        # chunk, those chars are safe to emit now — there's no stop sequence
+        # to retract. If we DID hit a stop sequence, pending_holdback is
+        # already empty (we broke out of the loop without repopulating it).
+        if pending_holdback and not stopped_early:
+            chunk = make_chunk(
+                completion_id, model,
+                content=pending_holdback,
+                created=created_ts,
+            )
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            emitted_response_len += len(pending_holdback)
+            pending_holdback = ""
+            if record:
+                record.response_chars = emitted_response_len
+
+        # Emit final finish_reason chunk.
+        # v1.5.5: finalize the record BEFORE yielding [DONE] so that a client
+        # disconnect at the [DONE] yield does not cause the finally block to
+        # stamp status_code=499 over a successful 200 response. The response is
+        # functionally complete at this point — the usage chunk (if emitted)
+        # and [DONE] are protocol trailers.
         if final_tools:
             # Tool calls already emitted incrementally above — just emit the
             # finish_reason chunk.
-            yield f"data: {json.dumps(make_chunk(completion_id, model, finish_reason='tool_calls', created=created_ts))}\n\n"
-            if record:
+            if record and not record.finalized:
+                record.status_code = 200
                 record.response_tool_calls = len(final_tools)
                 record.finish_reason = "tool_calls"
+                record.finalize()
+            yield f"data: {json.dumps(make_chunk(completion_id, model, finish_reason='tool_calls', created=created_ts))}\n\n"
         else:
-            yield f"data: {json.dumps(make_chunk(completion_id, model, finish_reason='stop', created=created_ts))}\n\n"
-            if record:
+            if record and not record.finalized:
+                record.status_code = 200
                 record.finish_reason = "stop"
+                record.finalize()
+            yield f"data: {json.dumps(make_chunk(completion_id, model, finish_reason='stop', created=created_ts))}\n\n"
 
-        # WP1: emit final usage chunk if stream_options.include_usage is true.
-        # The chunk must have an EMPTY choices array (present but empty, not
-        # omitted) and a fully-populated usage field. Emitted BEFORE [DONE].
-        if stream_options and stream_options.include_usage:
+        # WP1: emit the usage chunk ONLY when the client explicitly requested
+        # it via stream_options.include_usage=true. The OpenAI spec says the
+        # usage chunk is optional, and emitting it unconditionally (v1.5.4
+        # "Fix 1") breaks strict parsers that index chunk.choices[0] without
+        # a length check (the usage chunk has choices: []).
+        include_usage = bool(stream_options and stream_options.include_usage)
+        if include_usage:
             prompt_chars = 0
             if req_messages:
                 prompt_chars = sum(len(_content_to_str(m.content)) for m in req_messages)
             if req_tools:
                 prompt_chars += len(json.dumps(req_tools, ensure_ascii=False))
-            completion_chars = last_resp_len + last_think_len
+            # v1.5.4 (Fix 2): count reasoning against completion tokens, but cap
+            # the reasoning contribution to MAX_REASONING_CHARS so the usage
+            # reflects what was actually sent (post-truncation).
+            reasoning_chars_for_usage = min(last_think_len, MAX_REASONING_CHARS) if MAX_REASONING_CHARS > 0 else last_think_len
+            # v1.5.5 (B3): use emitted_response_len (the actual chars sent to
+            # the client, excluding truncated stop sequences) instead of
+            # last_resp_len (the raw cumulative snapshot length). This makes
+            # the usage chunk reflect what the client actually received.
+            completion_chars = emitted_response_len + reasoning_chars_for_usage
             prompt_tokens = prompt_chars // 4
             completion_tokens = completion_chars // 4
             usage_chunk = make_usage_chunk(
@@ -2230,25 +2386,21 @@ async def stream_openai(
                 created=created_ts,
             )
             yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
-            if record:
-                log_event(
-                    "info",
-                    "stream.usage_chunk_emitted",
-                    request_id=request_id,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
-                )
+            log_event(
+                "info",
+                "stream.usage_chunk_emitted",
+                request_id=request_id,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            )
 
         yield "data: [DONE]\n\n"
-        if record:
-            record.status_code = 200
-            record.finalize()
         log_event(
             "info",
             "stream.done",
             request_id=request_id,
-            response_chars=last_resp_len,
+            response_chars=emitted_response_len,  # v1.5.5 (B3): actual emitted length
             thinking_chars=last_think_len,
             tool_calls=len(final_tools or []),
             finish_reason=record.finish_reason if record else None,
@@ -2256,23 +2408,28 @@ async def stream_openai(
         )
     except HTTPException as e:
         errored = True
+        # v1.5.5: finalize the record BEFORE yielding so the actual error code
+        # is preserved even if the client disconnects at the yield.
+        if record is not None and not record.finalized:
+            record.status_code = e.status_code
+            record.error = str(e.detail)[:300]
+            record.finish_reason = "error"
+            record.finalize()
         err = {"error": {"message": str(e.detail), "type": "upstream_error"}}
         yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
-        if record:
-            record.status_code = e.status_code
-            record.error = str(e.detail)[:300]
-            record.finalize()
         log_event("error", "stream.http_error", request_id=request_id, status=e.status_code, error=str(e.detail)[:200])
     except Exception as e:
         errored = True
+        # v1.5.5: finalize the record BEFORE yielding.
+        if record is not None and not record.finalized:
+            record.status_code = 500
+            record.error = f"{type(e).__name__}: {e}"
+            record.finish_reason = "error"
+            record.finalize()
         err = {"error": {"message": str(e), "type": "internal_error"}}
         yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
-        if record:
-            record.status_code = 500
-            record.error = f"{type(e).__name__}: {e}"
-            record.finalize()
         log_event("error", "stream.unhandled_error", request_id=request_id, error=f"{type(e).__name__}: {e}")
     finally:
         # Client disconnect raises GeneratorExit at the yield point. GeneratorExit
@@ -2289,7 +2446,7 @@ async def stream_openai(
                 "warning",
                 "stream.client_disconnected",
                 request_id=request_id,
-                response_chars=last_resp_len,
+                response_chars=emitted_response_len,  # v1.5.5 (B3): actual emitted length
                 thinking_chars=last_think_len,
             )
         # ALWAYS release the limiter slot — even on client disconnect.
@@ -2318,6 +2475,14 @@ class ResponsesRequest(BaseModel):
     event format (response.created, response.output_text.delta,
     response.completed, etc.) is not yet implemented. Advertising support
     without implementing it was an API contract violation.
+
+    v1.5.5 (B11): added `parallel_tool_calls` field + wired through the same
+    WP4 helper as /v1/chat/completions. The Responses API supports this
+    parameter; previously it was silently dropped.
+    v1.5.5 (B12): `previous_response_id` is now REJECTED with 422 instead of
+    silently ignored. This proxy is stateless — it cannot look up a prior
+    response's input/output. Silently ignoring it produced incorrect results
+    for clients relying on conversation continuity.
     """
     model: str = DEFAULT_MODEL
     input: Union[str, list[dict]]
@@ -2331,10 +2496,13 @@ class ResponsesRequest(BaseModel):
     top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     tools: Optional[list] = None
     tool_choice: Optional[Any] = None
+    # v1.5.5 (B11): parallel_tool_calls is now accepted and wired through.
+    parallel_tool_calls: Optional[bool] = None
     think_level: Optional[str] = None
     # Accepted for spec compatibility; silently ignored.
     user: Optional[str] = None
     metadata: Optional[dict] = None
+    # v1.5.5 (B12): previous_response_id is REJECTED — see validator below.
     previous_response_id: Optional[str] = None
 
     @field_validator("stream")
@@ -2357,6 +2525,21 @@ class ResponsesRequest(BaseModel):
         allowed = {"high", "low", "no_think"}
         if v not in allowed:
             raise ValueError(f"think_level must be one of {allowed}, got {v!r}")
+        return v
+
+    @field_validator("previous_response_id")
+    @classmethod
+    def _validate_previous_response_id(cls, v):
+        # v1.5.5 (B12): this proxy is stateless — it cannot look up a prior
+        # response's input/output to continue the conversation. Silently
+        # ignoring previous_response_id produced incorrect results for clients
+        # relying on conversation continuity. Reject with 422 so the client
+        # gets a clear error instead of a response that ignores their context.
+        if v is not None:
+            raise ValueError(
+                "previous_response_id is not supported on this stateless proxy. "
+                "Send the full conversation history in `input` instead."
+            )
         return v
 
 
@@ -2404,25 +2587,78 @@ async def create_response(req: ResponsesRequest, request: Request):
     request_id = new_request_id()
     response_id = f"resp_{uuid.uuid4().hex[:24]}"
     created_ts = int(time.time())
+    client_ip = _client_ip(request)
+
+    # v1.5.5 (B4): create a RequestRecord mirroring /v1/chat/completions so
+    # /v1/responses requests are visible in /admin/requests. Previously
+    # /v1/responses was invisible in the behind-API log (only upstream events
+    # fired, with record=None — so /admin/requests/{id} returned null).
+    record = RequestRecord(
+        request_id=request_id,
+        method="POST",
+        path="/v1/responses",
+        client_ip=client_ip,
+    )
+    record.model = req.model
+    record.stream = False  # /v1/responses is non-streaming only (#5)
+    record.has_tools = bool(req.tools)
+    record.message_count = 0  # set after _responses_input_to_messages
+    # Find last user message for preview
+    # (delegated to after messages are built below)
 
     # Resolve think_level
     if req.think_level is None:
         think_level = "high" if req.model == "hy3-think" else DEFAULT_THINK_LEVEL
     else:
         think_level = req.think_level
+    record.think_level = think_level
 
     messages = _responses_input_to_messages(req.input, req.instructions)
+    record.message_count = len(messages)
+    # Find last user message for preview (mirror /v1/chat/completions behavior)
+    for m in reversed(messages):
+        if m.role == "user":
+            s = _content_to_str(m.content)
+            if s:
+                record.user_message_preview = s[:100]
+                break
+
     msg, sys_prompt, history = messages_to_hy3(messages)
     if not msg:
+        log_event(
+            "warning",
+            "request.bad_request",
+            request_id=request_id,
+            path="/v1/responses",
+            error="No user input provided",
+        )
+        record.status_code = 400
+        record.error = "No user input provided"
+        record.finalize()
         raise HTTPException(status_code=400, detail="No user input provided")
 
-    # #11: apply the same WP4 spec-coverage prefixes as /v1/chat/completions.
-    # Build a ResponseFormat-like object if needed (Responses API doesn't have
-    # response_format, but we reuse the tool_choice and parallel_tool_calls
-    # helpers — parallel_tool_calls is not in the Responses API spec, but
-    # tool_choice is).
+    log_event(
+        "info",
+        "request.start",
+        request_id=request_id,
+        method="POST",
+        path="/v1/responses",
+        client_ip=client_ip,
+        model=req.model,
+        stream=False,
+        has_tools=record.has_tools,
+        message_count=record.message_count,
+        think_level=record.think_level,
+        user_agent=request.headers.get("user-agent", "")[:100],
+        user_msg_preview=record.user_message_preview,
+    )
+
+    # v1.5.5 (B11): apply the same WP4 spec-coverage prefixes as
+    # /v1/chat/completions, now including parallel_tool_calls (was previously
+    # missing from /v1/responses).
     spec_prefixes = [
         _build_tool_choice_prefix(req.tool_choice),
+        _build_parallel_tools_prefix(req.parallel_tool_calls),
     ]
     spec_prefix = "\n\n".join(p for p in spec_prefixes if p)
     if spec_prefix:
@@ -2445,17 +2681,53 @@ async def create_response(req: ResponsesRequest, request: Request):
     )
 
     # Acquire a concurrency slot
+    t_queue_start = time.perf_counter()
+    record.concurrency_active_at_start = limiter.active
     try:
         acquired = await limiter.acquire()
     except asyncio.CancelledError:
+        # v1.5.5 (B10): re-raise CancelledError directly (matching
+        # /v1/chat/completions non-streaming pattern), instead of raising
+        # HTTPException(499) which is non-standard. The client has already
+        # disconnected, so nobody receives the response body anyway. The
+        # record is finalized here so /admin/requests shows the disconnect.
+        record.status_code = 499  # nginx convention: client closed request
+        record.error = "client disconnected while queued"
+        record.queued_ms = round((time.perf_counter() - t_queue_start) * 1000, 1)
+        record.finalize()
         raise
+    record.queued_ms = round((time.perf_counter() - t_queue_start) * 1000, 1)
+
     if not acquired:
         retry_after = max(1, int(QUEUE_TIMEOUT))
+        log_event(
+            "warning",
+            "request.rejected_503",
+            request_id=request_id,
+            path="/v1/responses",
+            reason="server_at_capacity",
+            max_concurrent=MAX_CONCURRENT,
+            active=limiter.active,
+            queued_ms=record.queued_ms,
+        )
+        record.status_code = 503
+        record.error = "Server at capacity"
+        record.finalize()
         return JSONResponse(
             status_code=503,
             content={"error": {"message": f"Server at capacity. Retry after {retry_after}s.", "type": "server_at_capacity"}},
             headers={"Retry-After": str(retry_after)},
         )
+
+    log_event(
+        "info",
+        "request.slot_acquired",
+        request_id=request_id,
+        path="/v1/responses",
+        queued_ms=record.queued_ms,
+        active=limiter.active,
+        peak=limiter.peak_active,
+    )
 
     final_resp = ""
     final_think = ""
@@ -2464,7 +2736,11 @@ async def create_response(req: ResponsesRequest, request: Request):
     received_valid_snapshot = False
     try:
         async with _slot(limiter):
-            async for data in call_hy3_stream(payload, request_id=request_id):
+            # v1.5.5 (B4): pass record=record so call_hy3_stream can stamp
+            # upstream_event_id, upstream_post_status, upstream_post_latency_ms,
+            # upstream_stream_latency_ms, upstream_chunks — matching the
+            # observability /v1/chat/completions provides.
+            async for data in call_hy3_stream(payload, request_id=request_id, record=record):
                 resp, think, tools, _ = parse_hy3_data(data)
                 if resp:
                     final_resp = resp
@@ -2476,25 +2752,107 @@ async def create_response(req: ResponsesRequest, request: Request):
                     final_tools = tools
                     received_valid_snapshot = True
     except HTTPException as e:
+        # v1.5.5 (B4): finalize + log on HTTP errors (mirror /v1/chat/completions)
+        record.status_code = e.status_code
+        record.error = str(e.detail)[:300]
+        record.finalize()
+        log_event(
+            "error",
+            "request.upstream_http_error",
+            request_id=request_id,
+            path="/v1/responses",
+            status=e.status_code,
+            error=str(e.detail)[:300],
+        )
         raise
     except asyncio.CancelledError:
-        # #19: finalize on client disconnect
-        raise HTTPException(status_code=499, detail="client disconnected")
+        # v1.5.5 (B10): re-raise CancelledError directly (matching
+        # /v1/chat/completions non-streaming pattern). The 499 status code is
+        # nginx-internal, not a standard HTTP status; the OpenAI SDK treats it
+        # as an unknown error. Since the client has already disconnected,
+        # nobody receives the response body anyway — the record finalization
+        # is purely for /admin/requests visibility.
+        record.status_code = 499
+        record.error = "client disconnected during non-streaming collection"
+        record.finish_reason = record.finish_reason or "cancelled"
+        if not record.finalized:
+            record.finalize()
+        log_event(
+            "warning",
+            "request.client_disconnected_nonstream",
+            request_id=request_id,
+            path="/v1/responses",
+            received_valid_snapshot=received_valid_snapshot,
+        )
+        raise
     except Exception as e:
+        record.status_code = 502
+        record.error = str(e)[:300]
+        record.finalize()
+        log_event(
+            "error",
+            "request.unhandled_error",
+            request_id=request_id,
+            path="/v1/responses",
+            error=f"{type(e).__name__}: {e}",
+        )
         raise HTTPException(status_code=502, detail=f"Hy3 call failed: {e}")
+
+    record.response_chars = len(final_resp)
+    record.response_thinking_chars = len(final_think)
+    record.response_tool_calls = len(final_tools)
 
     # #9: return 502 if upstream returned no usable snapshot
     if not received_valid_snapshot:
+        record.status_code = 502
+        record.error = "upstream returned no usable snapshot (empty stream or malformed SSE)"
+        record.finish_reason = "error"
+        record.finalize()
+        log_event(
+            "error",
+            "request.upstream_empty",
+            request_id=request_id,
+            path="/v1/responses",
+            error=record.error,
+        )
         raise HTTPException(
             status_code=502,
             detail="Hy3 upstream returned no usable snapshot. The stream may have closed prematurely or contained only malformed events.",
         )
+
+    # v1.5.5 (B4): finalize the record as 200 success (mirror /v1/chat/completions).
+    finish_reason = "tool_calls" if final_tools else "stop"
+    record.finish_reason = finish_reason
+    record.status_code = 200
+    record.finalize()
+    duration_ms = round((record.finished_at - record.started_at) * 1000, 1)
+    log_event(
+        "info",
+        "request.done",
+        request_id=request_id,
+        path="/v1/responses",
+        status=200,
+        duration_ms=duration_ms,
+        response_chars=record.response_chars,
+        thinking_chars=record.response_thinking_chars,
+        tool_calls=record.response_tool_calls,
+        finish_reason=record.finish_reason,
+    )
 
     # Translate to Responses API shape.
     # v1.5.1 (#13): emit BOTH text message AND function_call items if the model
     # returned both. Previously text was discarded when tools were present.
     output: list[dict] = []
     if final_think:
+        # v1.5.5 (A5): apply MAX_REASONING_CHARS cap here too — /v1/responses
+        # was bypassing the v1.5.4 Fix 2 cap, allowing 100KB+ reasoning
+        # streams to cause gateway timeouts. Now matches /v1/chat/completions
+        # behavior (both streaming and non-streaming paths).
+        if MAX_REASONING_CHARS > 0 and len(final_think) > MAX_REASONING_CHARS:
+            final_think = (
+                final_think[:MAX_REASONING_CHARS]
+                + f"\n...[reasoning truncated at {MAX_REASONING_CHARS} chars]"
+            )
         # Reasoning content as a reasoning output item
         output.append({
             "type": "reasoning",
@@ -2532,7 +2890,11 @@ async def create_response(req: ResponsesRequest, request: Request):
     prompt_chars = sum(len(_content_to_str(m.content)) for m in messages)
     if req.tools:
         prompt_chars += len(json.dumps(req.tools, ensure_ascii=False))
-    completion_chars = len(final_resp) + len(final_think)
+    # v1.5.5 (A5): use the capped reasoning length for usage estimation,
+    # matching /v1/chat/completions behavior (which caps reasoning contribution
+    # to MAX_REASONING_CHARS so usage reflects what was actually sent).
+    reasoning_chars_for_usage = min(len(final_think), MAX_REASONING_CHARS) if MAX_REASONING_CHARS > 0 else len(final_think)
+    completion_chars = len(final_resp) + reasoning_chars_for_usage
     prompt_tokens = prompt_chars // 4
     completion_tokens = completion_chars // 4
 

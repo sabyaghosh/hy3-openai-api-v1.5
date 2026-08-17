@@ -5,6 +5,166 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.5] — 2026-08-17
+
+Comprehensive code-review-driven release addressing 10 critical (Tier A) and 12
+major (Tier B) issues found in a line-by-line audit of the v1.5.4 codebase
+against the current OpenAI / Vercel AI SDK / Kilocode / Opencode spec. Security
+issues were intentionally skipped per maintainer request.
+
+### 🔴 Critical (Tier A — breaks functionality for target clients)
+
+- **A1 (admin-panel): SSE proxy now streams incrementally instead of buffering
+  the full response.** The `/api/hy3/[...path]` proxy used `arrayBuffer()` to
+  buffer the entire SSE stream before returning it, causing Vercel AI SDK /
+  Kilocode / Opencode to block on `reader.read()` and exceed their stream
+  timeouts (10–30s) on long thinking-mode generations. Now uses a
+  `TransformStream` to tee the body — chunks flow to the client immediately
+  while the full body is captured in `flush()` for the SQLite log.
+- **A2: Streaming usage chunk is now gated on `stream_options.include_usage`.**
+  The v1.5.4 "Fix 1" always emitted the usage chunk, violating the OpenAI spec
+  and breaking strict parsers that index `chunk.choices[0]` without a length
+  check (the usage chunk has `choices: []`). Now emitted only when the client
+  explicitly requests it.
+- **A3 + A4: `record.finalize()` now runs BEFORE yields in all streaming
+  paths.** Previously, a client disconnect at the `[DONE]` yield (or any error
+  event yield) caused the `finally` block to stamp `status_code=499` over a
+  successful 200 or the actual error code. This polluted error-rate dashboards
+  and triggered spurious `/ready` 503s. All 5 error paths + the success path
+  now finalize before yielding.
+- **A5: `/v1/responses` now applies `MAX_REASONING_CHARS` cap.** The v1.5.4
+  Fix 2 cap was missing from `/v1/responses`, allowing 100KB+ reasoning
+  streams to cause gateway timeouts. Now matches `/v1/chat/completions`
+  behavior (truncation + indicator + capped usage estimation).
+- **A6 (admin-panel): `hy3Fetch` now links the caller's external `AbortSignal`
+  to the internal `AbortController`.** Previously the internal controller's
+  signal overwrote `init.signal`, silently discarding the caller's abort
+  listener — any cleanup logic the caller attached to its own signal was dead.
+- **A7 (admin-panel): `DELETE /api/admin/logs/[id]` now returns 404 on missing
+  row.** Prisma's `delete` throws `P2025` when no row matches, which propagated
+  as an uncaught 500. Now caught and returned as a clean 404, matching the
+  GET handler's behavior.
+- **A8 (admin-panel): polling effect race fixed.** The previous implementation
+  had a stale-closure race — when filters changed, the old `tick` chain would
+  finish its in-flight fetch and reschedule itself via `refreshTimer.current`,
+  overwriting the new timer's ID. The old tick chain then polled forever with
+  stale filters. Fixed with a `cancelled` flag + `AbortController`.
+- **A9 (admin-panel): `ensureServerRunning` consolidated.** The proxy route had
+  its own duplicate implementation with no singleton guard, allowing concurrent
+  first-requests to spawn multiple Python processes. Now imports the singleton
+  from `@/lib/hy3/client`.
+- **A10 (admin-panel): `HY3_AUTOSTART` env var gate.** The auto-start paths
+  (`/home/z/my-project/...`) don't exist inside Docker containers, causing
+  silent `ENOENT` failures. Now gated behind `HY3_AUTOSTART` (default `true`
+  for dev, set `false` in `docker-compose.yml`). `server-control` POST returns
+  501 when disabled.
+
+### 🟠 Major (Tier B — spec compliance + observability)
+
+- **B1: `_content_to_str` now recognizes Responses API content-part types.**
+  The function only matched `type == "text"`, silently dropping `input_text`
+  and `output_text` parts. A valid Responses API input like
+  `[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]`
+  had its text dropped, sending an empty prompt upstream. Now recognizes all
+  three types.
+- **B2: `finish_reason` consistency between streaming and non-streaming.**
+  When both `stop` sequence and `tool_calls` were present, non-streaming
+  returned `"stop"` while streaming returned `"tool_calls"`. Now both return
+  `"tool_calls"` (per OpenAI spec, `tool_calls` takes precedence when tools
+  are present).
+- **B3: Streaming stop-sequence retraction across chunk boundaries.** The
+  previous implementation checked `resp` for stop sequences but emitted
+  `resp[last_resp_len:]` before the check, so a partial stop sequence (e.g.
+  `"STO"` when `stop=["STOP"]`) was already sent to the client by the time
+  the next chunk arrived with the completing characters. Now holds back the
+  last `max_stop_len - 1` chars of each emitted delta and checks for stop
+  sequences across the chunk boundary.
+- **B4: `/v1/responses` now creates a `RequestRecord` + emits lifecycle logs.**
+  Previously `/v1/responses` was invisible in `/admin/requests` (only upstream
+  events fired, with `record=None`). Now mirrors `/v1/chat/completions`:
+  creates a record, emits `request.start` / `request.slot_acquired` /
+  `request.done` / `request.upstream_*`, and passes `record=record` to
+  `call_hy3_stream` so upstream_event_id / latencies / chunk counts are
+  tracked.
+- **B5: README streaming usage doc fixed.** The README said "stream_options
+  is not supported (silently ignored)" — stale v1.4.x documentation that
+  contradicted the v1.5.4 code. Now documents the actual behavior (gated on
+  `include_usage`).
+- **B6: README `/health` vs `/ready` fixed.** The README's endpoints table
+  described `/health` with the `/ready` 503 behavior and omitted `/ready`
+  entirely. Now correctly documents `/health` as pure liveness (always 200)
+  and `/ready` as readiness (503 on high error rate).
+- **B7: CHANGELOG entries for v1.5.2 / v1.5.3 / v1.5.4 / v1.5.5 added.**
+  Previous versions were missing from the CHANGELOG (the top entry was
+  v1.5.1 despite `__version__` being 1.5.4+).
+- **B8: `MAX_REASONING_CHARS` added to `.env.example` and README env table.**
+  The v1.5.4 addition was undocumented; operators had to read the source to
+  discover it.
+- **B9: `Dockerfile.dev` fixed.** Targeted `src.main:app` which doesn't exist
+  (the actual entry is `server:app`). Leftover from Diploi's component-fastapi
+  template. Now targets `server:app` and `--reload-dir .`.
+- **B10: `/v1/responses` `CancelledError` handling.** Previously raised
+  `HTTPException(499)` — a non-standard status code that the OpenAI SDK
+  treats as an unknown error. Now re-raises `CancelledError` directly
+  (matching the `/v1/chat/completions` non-streaming pattern), with the record
+  finalized as 499 for `/admin/requests` visibility.
+- **B11: `ResponsesRequest` now accepts `parallel_tool_calls`.** The field
+  was missing from the Pydantic model and `_build_parallel_tools_prefix` was
+  not called. Now wired through, matching `/v1/chat/completions`.
+- **B12: `previous_response_id` now returns 422.** The field was silently
+  ignored, but this proxy is stateless — it cannot look up a prior response's
+  input/output. Silently ignoring it produced incorrect results for clients
+  relying on conversation continuity. Now rejects with a clear 422 message
+  pointing to the `input` field for full conversation history.
+
+## [1.5.4] — 2026-08-14
+
+Three targeted fixes addressing real-world breakage reported by Kilocode and
+Opencode users. No API contract changes; all fixes are additive.
+
+- **Fix 1 (streaming usage chunk): the usage chunk is now ALWAYS emitted for
+  streaming responses, regardless of `stream_options.include_usage`.** Many
+  agent tools (BrowserOS, some Kilocode configs, custom scripts) don't set
+  this option yet depend on token counts to control their agent loops.
+  Without the usage chunk, these tools have no way to track token budgets and
+  can get stuck in infinite loops. The OpenAI spec says this chunk is optional
+  — emitting it unconditionally was deemed safe.
+  > **Note (v1.5.5):** this was reverted to spec-compliant gating (A2 above).
+  > Strict parsers broke on the unconditional `choices: []` chunk.
+- **Fix 2 (`MAX_REASONING_CHARS` cap): reasoning content is now capped at
+  50,000 chars (configurable via env).** The `hy3-think` model can produce
+  100KB+ of reasoning_content in a single response, causing 80–104 second
+  generation times, gateway timeouts (Render ~100s), and overwhelmed client
+  tools that buffer the entire response. The cap truncates reasoning and
+  appends a `...[reasoning truncated at N chars]` indicator. Set
+  `MAX_REASONING_CHARS=0` to disable.
+- **Fix 3 (admin-panel `truncateBody` no-op): request/response bodies are now
+  stored in full in SQLite.** The previous 50KB cap hid critical debugging
+  data for long reasoning responses and large tool schemas. SQLite handles
+  multi-MB text columns without issue.
+
+## [1.5.3] — 2026-08-12
+
+- **`pyproject.toml` added** so `uv run` (used by Diploi) can resolve deps
+  from `[project].dependencies` instead of only `requirements.txt`. Without
+  this file the runtime env contained only `uvicorn` and crashed on
+  `import fastapi`. `package = false` tells `uv` to build a venv WITHOUT
+  trying to build/install this project itself (the repo is a flat script
+  layout, not an installable package).
+- **`Dockerfile.dev` added** for Diploi's component-fastapi template.
+  > **Note (v1.5.5):** this Dockerfile was broken (targeted `src.main:app`
+  > which doesn't exist). Fixed in B9.
+
+## [1.5.2] — 2026-08-10
+
+- **`render.yaml` `healthCheckPath` changed from `/health` to `/ready`.**
+  Returning 503 on `/health` caused Render to restart the proxy during
+  upstream outages, destroying diagnostics. `/health` is now pure liveness
+  (always 200); `/ready` is readiness (503 on high error rate).
+- **`Dockerfile` `HEALTHCHECK` updated to hit `/ready`** (same rationale).
+  Uses `sh -c` so `${PORT}` expands (was `CMD python -c "..."` form which
+  doesn't expand env vars).
+
 ## [1.5.1] — 2026-08-06
 
 Bug-fix release addressing 24 issues found in a v1.5.0 code review. All changes

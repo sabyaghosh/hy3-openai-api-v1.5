@@ -128,7 +128,7 @@ Follow-up fix release addressing issues found in a post-1.3.0 code review:
 - **Timing-safe auth** — API key and admin token validation now use `hmac.compare_digest()` to prevent timing side-channel attacks
 - **Multimodal content** — `messages[].content` now accepts `str | list` (OpenAI multimodal format); text parts are extracted, non-text parts dropped
 - **Multiple system messages** — concatenated (OpenAI convention) instead of silently overwritten
-- **`/health` detects degradation** — returns 503 on counter overflow or high upstream error rate (>50% of last 10+ requests)
+- **`/ready` detects degradation** — returns 503 on high upstream error rate (>50% of last 10+ requests in the 50-outcome sliding window). `/health` is pure liveness (always 200).
 - **`hy3.sh` curl timeouts** — POST (30s) and stream GET (300s) no longer hang forever on unresponsive upstream
 - **`hy3.sh` stderr separation** — curl errors no longer mixed into SSE data (was breaking the JSON parser)
 - **Dockerfile HEALTHCHECK** — standalone `docker run` users now get container health status
@@ -299,7 +299,7 @@ Point any OpenAI-compatible client at `http://localhost:8000/v1` with any API ke
 
 > **Streaming caveats:**
 > - **Errors arrive as HTTP 200.** Because the SSE response headers (200) are sent before the upstream call runs, upstream failures are emitted as an SSE `data:` line with an `error` field, followed by `data: [DONE]`. The OpenAI Python SDK may raise a validation error on this shape rather than a clean `APIError`. If you need reliable error detection, use non-streaming requests.
-> - **`usage` is absent from streaming responses.** `stream_options: {"include_usage": true}` is not supported (silently ignored). Use non-streaming requests for token counts.
+> - **`usage` is emitted only when requested.** When `stream_options: {"include_usage": true}` is sent, the server emits a final usage chunk with `choices: []` (empty array, per the OpenAI spec) and a populated `usage` object before `data: [DONE]`. The Vercel AI SDK `@ai-sdk/openai-compatible` package's `includeUsage: true` setting triggers this. If `include_usage` is not set, no usage chunk is emitted (matching the OpenAI spec).
 
 ---
 
@@ -326,6 +326,7 @@ Point any OpenAI-compatible client at `http://localhost:8000/v1` with any API ke
 | `ADMIN_ORIGIN` | `*` | Allowed CORS origin. Set to a specific origin (e.g. `https://app.example.com`) to enable credentialed CORS |
 | `MAX_MESSAGES` | `1000` | Max messages per request (DoS protection) |
 | `MAX_CONTENT_CHARS` | `1000000` | Max total characters across all messages (DoS protection) |
+| `MAX_REASONING_CHARS` | `50000` | **(v1.5.4+)** Cap on `reasoning_content` length in chars. The `hy3-think` model can produce 100KB+ of reasoning, causing 80-104s generation times and gateway timeouts. This cap truncates reasoning and appends an indicator. Set to `0` to disable the cap. Applied to both `/v1/chat/completions` and `/v1/responses`, in both streaming and non-streaming paths. |
 
 ### Models
 
@@ -357,10 +358,12 @@ resp = client.chat.completions.create(
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/` | GET | — | Service info |
-| `/health` | GET | — | Liveness probe — returns 503 when more than 50% of the **last 50** requests errored, and the window holds at least 10 requests. The window slides, so health recovers automatically once bad requests age out; a single upstream blip will not brick the service. Response includes `recent_window` and `recent_error_rate`. |
+| `/health` | GET | — | **Liveness probe** (v1.5.1 #23) — always returns 200 while the FastAPI process is alive and the event loop is responsive. Does NOT check upstream health, because returning 503 here would cause orchestrators to restart the proxy during an upstream outage — destroying diagnostics. Response includes `uptime_seconds` and `active_requests`. |
+| `/ready` | GET | — | **Readiness probe** (v1.5.1 #23) — returns 503 when more than 50% of the **last 50** requests errored, and the window holds at least 10 requests. The window slides, so readiness recovers automatically once bad requests age out; a single upstream blip will not brick the service. Use this for orchestrator health checks (Render `healthCheckPath`, Kubernetes `readinessProbe`). Response includes `recent_window` and `recent_error_rate`. |
 | `/stats` | GET | — | Runtime counters (active, peak, rejected, completed) |
 | `/v1/models` | GET | — | OpenAI models list |
 | `/v1/chat/completions` | POST | `API_KEYS` (if set) | OpenAI chat completion (streaming + non-streaming) |
+| `/v1/responses` | POST | — | OpenAI Responses API adapter (non-streaming only; `stream=true` returns 422). `previous_response_id` returns 422 (stateless proxy). |
 | `/admin/logs` | GET | `ADMIN_TOKEN` | Recent log entries (filterable by level, request_id, event) |
 | `/admin/requests` | GET | `ADMIN_TOKEN` | Recent request records (newest first) |
 | `/admin/logs/summary` | GET | `ADMIN_TOKEN` | Counts by level + event for dashboard widgets |

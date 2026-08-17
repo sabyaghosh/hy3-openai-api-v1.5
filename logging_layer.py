@@ -52,12 +52,16 @@ REQUEST_BUFFER: deque = deque(maxlen=REQUEST_BUFFER_SIZE)
 
 def _truncate(s: Any, n: int = 500) -> Any:
     """Truncate a value for the ring buffer. Preserves scalar types (int,
-    float, bool) so dashboards can do numeric comparison without re-parsing.
+    float) so dashboards can do numeric comparison without re-parsing.
     Strings and complex types are truncated to n chars with a suffix indicator.
+
+    v1.5.5 (C10): removed `bool` from the isinstance tuple — it's redundant
+    because `bool` subclasses `int` (`isinstance(True, int)` is already True).
+    Behavior is unchanged; this just removes the dead branch.
     """
     if s is None:
         return ""
-    if isinstance(s, (int, float, bool)):
+    if isinstance(s, (int, float)):
         return s  # preserve scalar type — don't stringify
     if not isinstance(s, str):
         try:
@@ -156,9 +160,12 @@ class RequestRecord:
             "path": self.path,
             "client_ip": self.client_ip,
             "started_at": self.started_at,
+            # v1.5.5 (C8): add millisecond precision to match log_event's
+            # ts_iso format. Makes cross-referencing /admin/requests and
+            # /admin/logs timestamps easier (was whole-second only).
             "started_at_iso": time.strftime(
                 "%Y-%m-%dT%H:%M:%S", time.gmtime(self.started_at)
-            ) + "Z",
+            ) + f".{int((self.started_at % 1) * 1000):03d}Z",
             "finished_at": self.finished_at,
             "duration_ms": (
                 round((self.finished_at - self.started_at) * 1000, 1)
@@ -172,7 +179,11 @@ class RequestRecord:
             "has_tools": self.has_tools,
             "has_history": self.has_history,
             "message_count": self.message_count,
-            "user_message_preview": _truncate(self.user_message_preview, 100),
+            # v1.5.5 (C7): no _truncate here — server.py already truncates
+            # user_message_preview to 100 chars at assignment time. Double
+            # truncation was redundant (and _truncate on a short string is
+            # a no-op anyway, but this makes the data flow explicit).
+            "user_message_preview": self.user_message_preview,
             "think_level": self.think_level,
             "upstream_event_id": self.upstream_event_id,
             "upstream_post_status": self.upstream_post_status,
