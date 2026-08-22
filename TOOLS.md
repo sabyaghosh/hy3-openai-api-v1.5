@@ -74,7 +74,7 @@ After setup, verify:
 
 **"Context usage count is always 0"** — You're missing `includeUsage: true` in the provider options. Without it, the Vercel AI SDK does not request streaming usage and token tracking silently fails.
 
-**"Tool call returns null arguments"** — This was a v1.4.5 bug fixed in v1.5.0 by WP3. Verify your server is v1.5.0 or later by checking `GET /` returns `"version": "1.5.0"`.
+**"Tool call returns null arguments"** — This was a v1.4.5 bug fixed in v1.5.0 by WP3. Verify your server is v1.6.0 or later by checking `GET /` returns `"version": "1.6.0"`.
 
 ---
 
@@ -131,7 +131,7 @@ After setup, verify:
 
 **"Context usage count is always 0"** — Same root cause as Kilocode. Add `includeUsage: true` to the provider options. See upstream issue [anomalyco/opencode#423](https://github.com/anomalyco/opencode/issues/423) for background.
 
-**"No tool call received"** — Verify the server is v1.5.0+ (was a v1.4.5 bug fixed by WP3). Check `GET /` returns `"version": "1.5.0"`.
+**"No tool call received"** — Verify the server is v1.6.0+ (v1.4.5 had a tool-delta bug fixed by WP3; v1.6.0 fixed the round-trip re-call loop). Check `GET /` returns `"version": "1.6.0"`.
 
 ---
 

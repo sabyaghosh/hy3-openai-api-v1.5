@@ -55,6 +55,7 @@ from contextlib import asynccontextmanager
 import hmac
 import json
 import os
+import re
 import time
 import uuid
 from typing import Any, AsyncIterator, Literal, Optional, Union
@@ -64,7 +65,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from logging_layer import (
@@ -91,7 +92,7 @@ DEFAULT_THINK_LEVEL = "no_think"
 # metadata (visible at /docs, /openapi.json) and the / endpoint.
 # Keep in sync with: pyproject.toml [project].version and the CHANGELOG.md
 # top entry.
-__version__ = "1.5.5"
+__version__ = "1.6.0"
 
 # WP5: System fingerprint identifies the exact server build that produced a
 # response. Basing it on the Hy3 proxy version is sufficient — the upstream
@@ -562,6 +563,125 @@ limiter = ConcurrencyLimiter(MAX_CONCURRENT, QUEUE_TIMEOUT)
 # ----------------------- Pydantic Models -----------------------
 
 
+# v1.6.0 (F2): OpenAI rejects malformed `tools` / `tool_choice` with 400.
+# This proxy previously forwarded them verbatim, so a typo'd tool name or a
+# bad tool_choice shape produced confusing downstream behavior ("unknown"
+# function names, silently ignored tool_choice) instead of a clear error.
+# These shared validators are used by BOTH /v1/chat/completions and
+# /v1/responses. ValueError raised inside a field_validator becomes a 422.
+_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def _validate_tools_value(tools: Optional[list]) -> Optional[list]:
+    """Validate the OpenAI `tools` array shape; raise ValueError if malformed.
+
+    v1.6.0 (F9): accepts BOTH wire formats —
+      - Chat Completions (externally tagged):
+            {"type": "function", "function": {"name": ..., ...}}
+      - Responses API (internally tagged):
+            {"type": "function", "name": ..., "description": ..., "parameters": ...}
+    The Responses API moved the function fields to the top level (see the
+    OpenAI migration guide); rejecting that shape broke /v1/responses clients.
+    """
+    if tools is None:
+        return tools
+    if not isinstance(tools, list):
+        raise ValueError("tools: expected an array of tool objects")
+    seen_names: set[str] = set()
+    for i, t in enumerate(tools):
+        if not isinstance(t, dict):
+            raise ValueError(f"tools[{i}]: expected an object")
+        if t.get("type") != "function":
+            raise ValueError(
+                f"tools[{i}].type: only 'function' tools are supported, got {t.get('type')!r}"
+            )
+        fn = t.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name")  # externally tagged (Chat Completions)
+        elif "name" in t:
+            fn = t  # internally tagged (Responses API)
+            name = t.get("name")
+        else:
+            raise ValueError(f"tools[{i}]: missing 'function' object")
+        if not isinstance(name, str) or not _TOOL_NAME_RE.match(name):
+            raise ValueError(
+                f"tools[{i}].function.name: must be a-z, A-Z, 0-9, underscores "
+                f"or dashes, max 64 chars (got {name!r})"
+            )
+        if name in seen_names:
+            raise ValueError(f"tools[{i}]: duplicate function name {name!r}")
+        seen_names.add(name)
+    return tools
+
+
+def _normalize_tools_to_external(tools: Optional[list]) -> Optional[list]:
+    """Convert internally-tagged (Responses API) function tools to the
+    externally-tagged Chat Completions shape before forwarding upstream, so
+    Hy3 always sees one canonical schema regardless of which endpoint the
+    client called."""
+    if not tools:
+        return tools
+    out: list = []
+    for t in tools:
+        if not isinstance(t, dict) or t.get("type") != "function":
+            continue
+        if isinstance(t.get("function"), dict):
+            out.append(t)
+            continue
+        fn: dict = {"name": t.get("name")}
+        if t.get("description") is not None:
+            fn["description"] = t["description"]
+        if t.get("parameters") is not None:
+            fn["parameters"] = t["parameters"]
+        if t.get("strict") is not None:
+            fn["strict"] = t["strict"]
+        out.append({"type": "function", "function": fn})
+    return out
+
+
+def _validate_tool_choice_value(tool_choice: Optional[Any]) -> Optional[Any]:
+    """Validate the OpenAI `tool_choice` value; raise ValueError if malformed."""
+    if tool_choice is None:
+        return tool_choice
+    if isinstance(tool_choice, str):
+        if tool_choice in ("none", "auto", "required"):
+            return tool_choice
+        raise ValueError(
+            'tool_choice: must be "none", "auto", "required", or '
+            '{"type": "function", "function": {"name": ...}}'
+        )
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function")
+        if (
+            tool_choice.get("type") == "function"
+            and isinstance(fn, dict)
+            and isinstance(fn.get("name"), str)
+            and fn["name"]
+        ):
+            return tool_choice
+        raise ValueError(
+            'tool_choice: named function form must be '
+            '{"type": "function", "function": {"name": ...}}'
+        )
+    raise ValueError(
+        'tool_choice: must be "none", "auto", "required", or a named function object'
+    )
+
+
+def _tool_names_from_tools(tools: Optional[list]) -> set:
+    """Collect declared function names from either tool wire format."""
+    names: set = set()
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function")
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            names.add(fn["name"])
+        elif isinstance(t.get("name"), str):
+            names.add(t["name"])
+    return names
+
+
 class ChatMessage(BaseModel):
     # Literal catches typos like "usr" or "asistant" at 422 instead of
     # forwarding garbage to Hy3. "developer" is OpenAI's newer name for system.
@@ -603,6 +723,13 @@ class ChatCompletionRequest(BaseModel):
     # ge=1 rejects 0, negative, and (with the explicit is None check below)
     # ensures max_tokens is always a positive int when forwarded upstream.
     max_tokens: Optional[int] = Field(DEFAULT_MAX_TOKENS, ge=1)
+    # v1.6.0 (F1): `max_completion_tokens` is the current OpenAI parameter
+    # name (`max_tokens` is legacy but still accepted). Modern SDKs and agents
+    # (openai-python v2, Vercel AI SDK, opencode) send max_completion_tokens;
+    # previously it was silently dropped and the 4096 default applied instead,
+    # truncating responses for clients that explicitly raised the cap. When
+    # both are sent, max_completion_tokens wins (matches OpenAI precedence).
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     stream: bool = False
     tools: Optional[list] = None
     tool_choice: Optional[Any] = None
@@ -700,6 +827,31 @@ class ChatCompletionRequest(BaseModel):
         if v is not None and v != 1:
             raise ValueError(f"n must be 1 (Hy3 does not support multiple completions), got {v}")
         return v
+
+    # v1.6.0 (F2): strict tools/tool_choice validation, matching OpenAI's 400
+    # behavior for malformed values (surfaced here as 422).
+    @field_validator("tools")
+    @classmethod
+    def _validate_tools(cls, v):
+        return _validate_tools_value(v)
+
+    @field_validator("tool_choice")
+    @classmethod
+    def _validate_tool_choice(cls, v):
+        return _validate_tool_choice_value(v)
+
+    @model_validator(mode="after")
+    def _validate_tool_choice_target(self):
+        # OpenAI rejects tool_choice naming a function that isn't in `tools`.
+        tc = self.tool_choice
+        if isinstance(tc, dict):
+            name = tc.get("function", {}).get("name")
+            tool_names = _tool_names_from_tools(self.tools)
+            if name not in tool_names:
+                raise ValueError(
+                    f"tool_choice: function {name!r} is not present in tools"
+                )
+        return self
 
 
 # ----------------------- Helpers -----------------------
@@ -812,6 +964,24 @@ def messages_to_hy3(messages: list[ChatMessage]) -> tuple[str, str, list]:
             # Messages after the last user message (assistant turn, tool result,
             # etc.) become part of history so the model sees the latest state.
             trailing = non_system[last_user_idx + 1:]
+
+            # v1.6.0 (F7): tool-result round-trip fix. The upstream appends
+            # `msg` to the conversation as a NEW user turn (verified live:
+            # the returned history echo shows msg appended after history).
+            # Re-sending the original user question verbatim made the model
+            # see the same question twice — once already answered by a tool
+            # call, once fresh — so it just called the tool again, looping
+            # forever. An empty msg is rejected upstream (event: error).
+            # Verified live: sending a continuation cue as msg while the tool
+            # results sit in history makes the model answer from the results.
+            if any(m.role == "tool" for m in trailing):
+                last_user_msg = (
+                    "Your previous tool call(s) have been executed and their "
+                    'results are included in the conversation above as "tool" '
+                    "messages. Use those results to answer the user's original "
+                    "request. Do not repeat tool calls whose results are "
+                    "already provided."
+                )
         else:
             # No user message anywhere — caller is responsible for 400.
             # We return empty msg so the existing validation catches it.
@@ -1333,6 +1503,9 @@ def make_chunk(
         "model": model,
         # WP5: system_fingerprint identifies the exact server build.
         "system_fingerprint": SYSTEM_FINGERPRINT,
+        # v1.6.0 (F3): OpenAI includes `usage: null` on every chunk except the
+        # final include_usage chunk. Strict parsers expect the key to exist.
+        "usage": None,
         "choices": [choice],
     }
 
@@ -1511,6 +1684,24 @@ async def list_models():
     return {"object": "list", "data": data}
 
 
+@app.get("/v1/models/{model_id}")
+async def retrieve_model(model_id: str):
+    """OpenAI model retrieve endpoint (v1.6.0, F5).
+
+    The OpenAI SDK's client.models.retrieve("hy3") hits GET /v1/models/{id};
+    previously this 404'd (only the list endpoint existed), which broke tools
+    that probe a single model's capabilities before first use. Returns the
+    same enriched metadata shape as the list endpoint.
+    """
+    for m in HY3_MODELS:
+        if m["id"] == model_id:
+            return dict(m)
+    raise HTTPException(
+        status_code=404,
+        detail=f"The model '{model_id}' does not exist. Available: hy3, hy3-think",
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     # Optional API key check
@@ -1640,9 +1831,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         system_prompt=sys_prompt,
         history=history,
         think_level=think_level,
-        # Use explicit `is None` check — `or` would treat 0 as falsy (but Field(ge=1)
-        # already rejects 0, so this is belt-and-suspenders).
-        max_tokens=req.max_tokens if req.max_tokens is not None else DEFAULT_MAX_TOKENS,
+        # v1.6.0 (F1): max_completion_tokens takes precedence over legacy
+        # max_tokens when both are provided (matches OpenAI precedence).
+        max_tokens=(
+            req.max_completion_tokens
+            if req.max_completion_tokens is not None
+            else (req.max_tokens if req.max_tokens is not None else DEFAULT_MAX_TOKENS)
+        ),
         temperature=req.temperature,
         top_p=req.top_p,
         tools=effective_tools,
@@ -1885,7 +2080,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             record.response_chars = len(final_resp)
 
     # OpenAI spec: content should be null (not "") when tool_calls is present.
-    message: dict = {"role": "assistant", "content": final_resp or None}
+    # v1.6.0 (F4): conversely, when there are NO tool calls, content must be a
+    # string ("" for an empty response) — returning null for a plain empty
+    # response broke strict clients that call .content.strip() etc.
+    content_value: Optional[str] = (
+        None if final_tools else (final_resp or "")
+    )
+    message: dict = {"role": "assistant", "content": content_value}
     if final_think:
         # v1.5.4 (Fix 2): cap reasoning content at MAX_REASONING_CHARS to
         # prevent massive reasoning from overwhelming client tools.
@@ -1909,6 +2110,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if req.tools:
         prompt_chars += len(json.dumps(req.tools, ensure_ascii=False))
     completion_chars = len(final_resp) + len(final_think)
+    # v1.6.0 (F8): tool-call arguments are model output — count them toward
+    # completion tokens. Previously a pure tool-call response reported
+    # completion_tokens=0, breaking client-side cost/usage tracking.
+    if final_tools:
+        completion_chars += len(
+            json.dumps(make_tool_call_objects(final_tools), ensure_ascii=False)
+        )
     prompt_tokens = prompt_chars // 4
     completion_tokens = completion_chars // 4
 
@@ -2373,7 +2581,11 @@ async def stream_openai(
             # the client, excluding truncated stop sequences) instead of
             # last_resp_len (the raw cumulative snapshot length). This makes
             # the usage chunk reflect what the client actually received.
-            completion_chars = emitted_response_len + reasoning_chars_for_usage
+            # v1.6.0 (F8): include tool-call argument chars (model output).
+            tool_args_chars = sum(seen_tool_calls.values())
+            completion_chars = (
+                emitted_response_len + reasoning_chars_for_usage + tool_args_chars
+            )
             prompt_tokens = prompt_chars // 4
             completion_tokens = completion_chars // 4
             usage_chunk = make_usage_chunk(
@@ -2527,6 +2739,29 @@ class ResponsesRequest(BaseModel):
             raise ValueError(f"think_level must be one of {allowed}, got {v!r}")
         return v
 
+    # v1.6.0 (F2): same strict tools/tool_choice validation as Chat Completions.
+    @field_validator("tools")
+    @classmethod
+    def _validate_tools(cls, v):
+        return _validate_tools_value(v)
+
+    @field_validator("tool_choice")
+    @classmethod
+    def _validate_tool_choice(cls, v):
+        return _validate_tool_choice_value(v)
+
+    @model_validator(mode="after")
+    def _validate_tool_choice_target(self):
+        tc = self.tool_choice
+        if isinstance(tc, dict):
+            name = tc.get("function", {}).get("name")
+            tool_names = _tool_names_from_tools(self.tools)
+            if name not in tool_names:
+                raise ValueError(
+                    f"tool_choice: function {name!r} is not present in tools"
+                )
+        return self
+
     @field_validator("previous_response_id")
     @classmethod
     def _validate_previous_response_id(cls, v):
@@ -2547,7 +2782,20 @@ def _responses_input_to_messages(inp: Union[str, list[dict]], instructions: Opti
     """Convert Responses API `input` field to Chat Completions `messages` list.
 
     - str: treated as a single user message (with optional system instructions prepended)
-    - list[dict]: each dict must have role + content; passed through mostly unchanged
+    - list[dict]: each item is translated by its `type`:
+
+      v1.6.0 (F6): the Responses API tool loop requires round-tripping
+      function calls and their outputs. Previously every list item was mapped
+      via item.get("role", "user"), so `function_call_output` items (which
+      have NO role — only call_id/output) became empty user messages and the
+      model never saw the tool result, breaking multi-step tool calling on
+      /v1/responses. Now handled explicitly:
+        - {"type": "function_call", "call_id", "name", "arguments"}
+              → assistant message with tool_calls
+        - {"type": "function_call_output", "call_id", "output"}
+              → tool message with tool_call_id
+        - {"type": "message", "role", "content"} → plain message
+        - {"type": "reasoning", ...} → skipped (not replayable input)
     """
     messages: list[ChatMessage] = []
     if instructions:
@@ -2556,11 +2804,58 @@ def _responses_input_to_messages(inp: Union[str, list[dict]], instructions: Opti
         messages.append(ChatMessage(role="user", content=inp))
     elif isinstance(inp, list):
         for item in inp:
-            if isinstance(item, dict):
+            # Bare strings are accepted as user input per the Responses spec.
+            if isinstance(item, str):
+                messages.append(ChatMessage(role="user", content=item))
+                continue
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype == "function_call":
+                fn_args = item.get("arguments", "{}")
+                if not isinstance(fn_args, str):
+                    fn_args = json.dumps(fn_args, ensure_ascii=False)
+                call_id = item.get("call_id") or item.get("id")
+                messages.append(
+                    ChatMessage(
+                        role="assistant",
+                        content=None,
+                        tool_calls=[
+                            {
+                                "id": call_id or f"call_{uuid.uuid4().hex[:24]}",
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", "unknown"),
+                                    "arguments": fn_args,
+                                },
+                            }
+                        ],
+                    )
+                )
+            elif itype == "function_call_output":
+                out = item.get("output", "")
+                if not isinstance(out, str):
+                    out = json.dumps(out, ensure_ascii=False)
+                messages.append(
+                    ChatMessage(
+                        role="tool",
+                        content=out,
+                        tool_call_id=item.get("call_id") or "",
+                    )
+                )
+            elif itype == "reasoning":
+                # Reasoning items are model-internal state; not replayable here.
+                continue
+            else:
+                # Plain message item ({"type": "message", ...}) or a bare
+                # role/content dict from older clients.
                 role = item.get("role", "user")
-                content = item.get("content", "")
-                # Responses API content can be a list of parts; flatten via _content_to_str
-                messages.append(ChatMessage(role=role, content=content))
+                if role not in ("system", "user", "assistant", "tool", "developer"):
+                    role = "user"
+                msg = ChatMessage(role=role, content=item.get("content", ""))
+                if item.get("tool_call_id"):
+                    msg.tool_call_id = item["tool_call_id"]
+                messages.append(msg)
     return messages
 
 
@@ -2668,6 +2963,11 @@ async def create_response(req: ResponsesRequest, request: Request):
     effective_tools = req.tools
     if isinstance(req.tool_choice, str) and req.tool_choice == "none":
         effective_tools = None
+    # v1.6.0 (F9): the Responses API uses internally-tagged function tools
+    # ({"type": "function", "name": ...}); normalize to the externally-tagged
+    # Chat Completions shape so Hy3 always receives one canonical schema.
+    elif effective_tools:
+        effective_tools = _normalize_tools_to_external(effective_tools)
 
     payload = build_payload(
         msg=msg,
@@ -2872,6 +3172,9 @@ async def create_response(req: ResponsesRequest, request: Request):
                 "id": tc_id,
                 "call_id": tc_id,  # #12: same value as id
                 "name": fn.get("name", "unknown"),
+                # v1.6.0 (F6): OpenAI marks completed function_call items with
+                # an explicit status; some clients gate on it.
+                "status": "completed",
                 "arguments": fn.get("arguments", "{}"),
             })
     # #13: emit text message if there's any response text, regardless of
@@ -2895,6 +3198,11 @@ async def create_response(req: ResponsesRequest, request: Request):
     # to MAX_REASONING_CHARS so usage reflects what was actually sent).
     reasoning_chars_for_usage = min(len(final_think), MAX_REASONING_CHARS) if MAX_REASONING_CHARS > 0 else len(final_think)
     completion_chars = len(final_resp) + reasoning_chars_for_usage
+    # v1.6.0 (F8): count tool-call arguments toward completion tokens.
+    if final_tools:
+        completion_chars += len(
+            json.dumps(make_tool_call_objects(final_tools), ensure_ascii=False)
+        )
     prompt_tokens = prompt_chars // 4
     completion_tokens = completion_chars // 4
 

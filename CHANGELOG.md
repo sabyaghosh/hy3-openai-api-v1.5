@@ -5,6 +5,76 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] — 2026-08-21
+
+OpenAI Chat Completions conformance + tool-calling capability release, driven by
+a fresh audit against the current OpenAI API specification (function-calling
+guide, streaming reference, and SDK wire format) plus a live upstream probe
+confirming Hy3 accepts `role:"tool"` history entries and surfaces their content
+to the model.
+
+### Added
+
+- **F1: `max_completion_tokens` is now accepted on `/v1/chat/completions`.**
+  Modern OpenAI SDKs and agents send `max_completion_tokens` (the current
+  parameter name) instead of legacy `max_tokens`. Previously it was silently
+  dropped, so clients that raised the cap still got the 4096 default. When both
+  are sent, `max_completion_tokens` wins — matching OpenAI's precedence.
+- **F5: `GET /v1/models/{model_id}` retrieve endpoint.** The OpenAI SDK's
+  `client.models.retrieve("hy3")` previously 404'd; tools that probe a single
+  model's capabilities before first use were broken. Returns the same enriched
+  metadata shape as the list endpoint; unknown ids return an OpenAI-shaped 404.
+- **F6: `/v1/responses` now understands typed input items** — the missing half
+  of the Responses API tool loop:
+  - `{"type": "function_call", "call_id", "name", "arguments"}` → assistant
+    message with `tool_calls`
+  - `{"type": "function_call_output", "call_id", "output"}` → `role:"tool"`
+    message with `tool_call_id` (previously became an EMPTY user message, so
+    the model never saw tool results and multi-step tool calling was broken)
+  - bare string items and `{"type": "message"}` items handled per spec;
+    `{"type": "reasoning"}` items are skipped
+  - emitted `function_call` output items now carry `"status": "completed"`
+
+### Fixed
+
+- **F7: tool-result round-trips no longer loop (critical tool-calling fix).**
+  The upstream appends the top-level prompt as a NEW user turn after the
+  history (verified live via the history echo). On a tool round-trip the proxy
+  re-sent the original user question verbatim, so the model saw the same
+  question twice — once already answered by a tool call, once fresh — and just
+  called the tool again, looping forever. Now, when the conversation ends with
+  `role:"tool"` results, the top-level prompt is a continuation cue telling the
+  model to answer from the results above. Verified live: the model now answers
+  from the tool result instead of re-calling. (An empty prompt was also probed
+  and is rejected upstream with `event: error`, so a cue — not empty text — is
+  the correct shape.)
+- **F8: tool-call arguments now count toward `completion_tokens`.** A pure
+  tool-call response previously reported `completion_tokens=0` (arguments are
+  model output but weren't counted), breaking client-side usage/cost tracking.
+  Applied to `/v1/chat/completions` (streaming + non-streaming) and
+  `/v1/responses`.
+- **F9: `/v1/responses` now accepts internally-tagged (Responses-native)
+  function tools.** The Responses API moved function fields to the tool's top
+  level (`{"type": "function", "name": ...}`) while Chat Completions nests
+  them under `"function"`. The F2 validator only accepted the Chat Completions
+  shape, rejecting valid Responses clients with 422. Both shapes now validate;
+  internal form is normalized to external before forwarding upstream so Hy3
+  always sees one canonical schema.
+- **F2: `tools` / `tool_choice` are now validated like OpenAI.** Malformed
+  values (non-`function` tool types, missing/invalid function names, name
+  regex violations, duplicate names, unknown `tool_choice` shapes, or a named
+  `tool_choice` referencing a function not in `tools`) now return a clear 422
+  in the OpenAI error envelope instead of being forwarded verbatim to produce
+  confusing downstream behavior ("unknown" function names, silently ignored
+  `tool_choice`). Applied to both `/v1/chat/completions` and `/v1/responses`.
+- **F3: every non-usage stream chunk now includes `"usage": null`.** OpenAI's
+  wire format carries the key on all chunks except the final include_usage
+  chunk; strict parsers expect it to exist.
+- **F4: non-streaming `content` semantics corrected.** `content` is now `null`
+  ONLY when `tool_calls` are present (per OpenAI spec); a plain empty text
+  response returns `""` instead of `null`, which broke strict clients calling
+  string methods on `.content`.
+
 ## [1.5.5] — 2026-08-17
 
 Comprehensive code-review-driven release addressing 10 critical (Tier A) and 12
